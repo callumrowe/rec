@@ -1,7 +1,9 @@
 # rec
 
-macOS meeting recorder, v1: capture only. Records the built-in mic and all system
-audio into two time-aligned 16 kHz mono WAVs. Requires macOS 14.2 or later.
+macOS meeting recorder. Records the built-in mic and all system audio into two
+time-aligned 16 kHz mono WAVs, then transcribes them on-device with
+[FluidAudio](https://github.com/FluidInference/FluidAudio) into an Obsidian vault.
+Requires macOS 14.2 or later.
 
 ```
 make install                 # builds build/Rec.app, copies to ~/Applications, links ~/.local/bin/rec
@@ -11,6 +13,8 @@ rec start --mic streamcam    # skip the question (name substring or UID); --yes 
 rec devices                  # list inputs, their UIDs, and which one rec would default to
 rec stop
 rec verify [SESSION_DIR]     # length / silence / sync check (default: latest session)
+rec transcribe [SESSION_DIR] # (re)transcribe a session into the vault (default: latest session)
+rec config                   # choose the Obsidian vault; --vault PATH, --model v2|v3, --show
 ```
 
 Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
@@ -20,6 +24,40 @@ Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
 | `mic.wav`     | built-in mic, 16 kHz mono 16-bit |
 | `system.wav`  | everything the Mac plays, 16 kHz mono 16-bit |
 | `session.json`| start timestamp (ISO 8601 + epoch ms), end, duration, frame count, device UIDs, event log (gaps, device loss, silence warnings) |
+| `transcribe.log` | transcription progress and FluidAudio / Core ML diagnostics |
+
+## Transcription
+
+The first `rec start` asks which Obsidian vault to use (it lists the vaults
+Obsidian knows about, or takes a path; the folder must contain `.obsidian/`),
+creates `<vault>/transcriptions/` and saves the choice to
+`~/.config/rec/config.json`. `rec config` changes it later.
+
+When a recording stops (Ctrl-C or `rec stop`) it is transcribed in the
+background and a notification says when the note is ready:
+`<vault>/transcriptions/2026-09-23 14-30 Transcript.md`, with YAML frontmatter
+(date, duration, mic, speakers, session path, model, `tags: [transcript]`)
+and one line per turn:
+
+```
+**[00:03:12] Me:** Let's move the launch to Monday if Thursday slips.
+
+**[00:03:18] Speaker 2:** That works for me.
+```
+
+- **ASR:** Parakeet TDT 0.6B via FluidAudio, run separately on each track.
+  `v2` (English, default) or `v3` (25 European languages; `rec config --model v3`).
+  Models download once (~470 MB) to `~/Library/Application Support/FluidAudio/`.
+- **Speakers:** `mic.wav` is "Me". `system.wav` goes through FluidAudio's
+  offline diarizer (pyannote segmentation + VBx clustering); one remote voice is
+  "Them", several are "Speaker 1, 2…" in order of first speech. Each sentence
+  gets the speaker most of its words fall in, so labels don't flip mid-sentence.
+- **Echo:** without headphones the mic also hears the call. Mic words that the
+  system track said at the same moment (±0.8 s) are dropped, so remote speech
+  isn't duplicated as "Me".
+- Re-running `rec transcribe` on a session overwrites that session's note.
+  It runs from the CLI, not Rec.app, so writing into a vault under `~/Documents`
+  uses your terminal's file access.
 
 ## How it works
 

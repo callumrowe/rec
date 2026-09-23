@@ -72,15 +72,16 @@ enum Launcher {
         }
 
         // Choose the mic once, now; the recorder stays pinned to its UID.
+        let interactive = !skipPicker && isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0
         let micUID: String
         if let micQuery {
             let resolved = AudioDevices.resolveInput(micQuery)
             guard let input = resolved.input else { fail(resolved.error ?? "unknown mic") }
             micUID = input.uid
         } else {
-            let interactive = !skipPicker && isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0
             micUID = chooseMic(interactive: interactive).uid
         }
+        checkTranscription(interactive: interactive)
 
         let dir: URL
         if let outDir {
@@ -142,7 +143,9 @@ enum Launcher {
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: 0.2)
         timer.setEventHandler {
-            if !isAlive(recorder.pid) { withExtendedLifetime(sources) { exit(0) } }
+            guard !isAlive(recorder.pid) else { return }
+            Transcriber.launchInBackground(dir: dir.path)
+            withExtendedLifetime(sources) { exit(0) }
         }
         timer.resume()
         dispatchMain()
@@ -162,6 +165,7 @@ enum Launcher {
         } else {
             print("rec: stopped → \(recorder.dir)")
         }
+        Transcriber.launchInBackground(dir: recorder.dir)
         exit(0)
     }
 
@@ -248,6 +252,24 @@ enum Launcher {
                 guard readLine()?.lowercased().hasPrefix("y") == true else { continue }
             }
             return input
+        }
+    }
+
+    /// Transcripts need a vault: ask for one on first use, and make sure its
+    /// transcriptions/ folder is still there. Recording goes ahead either way.
+    private static func checkTranscription(interactive: Bool) {
+        guard let config = Config.load() else {
+            if interactive {
+                _ = ConfigCommand.firstRun()
+            } else {
+                print("rec: no Obsidian vault configured, so this recording won't be transcribed (see `rec config`)")
+            }
+            return
+        }
+        if let problem = Vault.check(config.vault) {
+            fputs("rec: ⚠ \(problem); transcription will fail until you run `rec config`\n", stderr)
+        } else if (try? Vault.ensureTranscriptionsDir(config)) == nil {
+            fputs("rec: ⚠ cannot create \(config.transcriptionsDir.path)\n", stderr)
         }
     }
 
