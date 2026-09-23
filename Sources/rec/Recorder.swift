@@ -31,6 +31,8 @@ let iso8601: ISO8601DateFormatter = {
 /// The long-running recording process (`rec _record <dir>`), launched inside Rec.app.
 final class Recorder {
     private let dir: URL
+    private let requestedMicUID: String?
+    private var micIsBuiltIn = true
     private let interactive = isatty(STDOUT_FILENO) != 0
     private var t0: UInt64 = 0
     private var session: SessionInfo!
@@ -53,8 +55,9 @@ final class Recorder {
     static let silenceThreshold = 1e-4  // -80 dBFS; real mics idle around -60..-70
     static let silenceWarnAfter: TimeInterval = 10
 
-    init(dir: URL) {
+    init(dir: URL, micUID: String? = nil) {
         self.dir = dir
+        self.requestedMicUID = micUID
     }
 
     func run() -> Never {
@@ -66,7 +69,9 @@ final class Recorder {
         if !requestMicrophoneAccess() {
             say("⚠ microphone access denied: mic.wav will be silent. Allow Rec in System Settings › Privacy & Security › Microphone.")
         }
-        let micUID = AudioDevices.builtInInputUID() ?? "BuiltInMicrophoneDevice"
+        let builtInUID = AudioDevices.builtInInputUID() ?? "BuiltInMicrophoneDevice"
+        let micUID = requestedMicUID ?? builtInUID
+        micIsBuiltIn = micUID == builtInUID
 
         // Both tracks are positioned relative to this single instant.
         t0 = mach_absolute_time()
@@ -88,7 +93,8 @@ final class Recorder {
         mic = MicCapture(uid: micUID, writer: micWriter, log: log)
         mic.start()
         saveSession()
-        say("rec: recording (mic: \(micUID)). Stop with `rec stop` or Ctrl-C.")
+        let micName = AudioDevices.device(uid: micUID).flatMap(AudioDevices.name) ?? micUID
+        say("rec: recording (mic: \(micName) [\(micUID)]). Stop with `rec stop` or Ctrl-C.")
 
         let meterTimer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(meterTimer, forMode: .common)
@@ -152,7 +158,7 @@ final class Recorder {
             saveSession()
         }
 
-        let lidClosed = isLidClosed() == true
+        let lidClosed = micIsBuiltIn && isLidClosed() == true
         if lidClosed != lastLidClosed {
             if lidClosed { log("mic: MacBook lid is closed; the built-in mic is muted until it opens") }
             else if lastLidClosed != nil { log("mic: MacBook lid opened") }

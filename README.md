@@ -7,6 +7,8 @@ audio into two time-aligned 16 kHz mono WAVs. Requires macOS 14.2 or later.
 make install                 # builds build/Rec.app, copies to ~/Applications, links ~/.local/bin/rec
 rec start                    # foreground, live levels; Ctrl-C or `rec stop` from anywhere to finish
 rec start --detach           # background; output goes to <session>/rec.log
+rec start --mic streamcam    # use another input (name substring or UID); or set REC_MIC=streamcam
+rec devices                  # list inputs and their UIDs
 rec stop
 rec verify [SESSION_DIR]     # length / silence / sync check (default: latest session)
 ```
@@ -24,7 +26,8 @@ Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
 - **System audio:** a global mono `CATapDescription` process tap
   (`AudioHardwareCreateProcessTap`) inside a private aggregate device, clocked by
   the built-in speakers so it survives headphones coming and going.
-- **Mic:** `AVAudioEngine` pinned to the built-in mic by device UID
+- **Mic:** `AVAudioEngine` pinned by device UID to the built-in mic, or to the device
+  chosen with `--mic` / `REC_MIC`
   (`kAudioOutputUnitProperty_CurrentDevice`). It never follows the system default
   input. If the device goes away, the gap is logged and filled with silence,
   system audio keeps recording, and capture resumes when the same UID returns.
@@ -41,8 +44,8 @@ Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
 ## Gotchas
 
 - **Lid closed = silent mic.** In clamshell mode the MacBook hardware-mutes the
-  built-in mic. rec logs this and warns, but it still records the built-in mic
-  (by design).
+  built-in mic. rec logs this and warns. At a desk setup, use `--mic` (e.g.
+  `export REC_MIC=streamcam` in your shell profile).
 - **Rebuilds and permissions.** The app is ad-hoc signed, so every build has a
   new signature. If a rebuilt Rec suddenly records silence, run
   `make reset-permissions` and approve the prompts again on the next `rec start`.

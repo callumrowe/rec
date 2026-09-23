@@ -68,8 +68,13 @@ final class MicCapture {
         let status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
                                           &dev, UInt32(MemoryLayout<AudioObjectID>.size))
         guard status == noErr else { return .failure("could not pin device (OSStatus \(status))") }
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else { return .failure("device reports no input format") }
+        // After switching devices the node's output format can still describe the
+        // previous (default) device; a tap in that format never receives buffers.
+        // Use the pinned device's hardware rate and channel count instead.
+        let hardware = input.inputFormat(forBus: 0)
+        guard hardware.sampleRate > 0, hardware.channelCount > 0,
+              let format = AVAudioFormat(standardFormatWithSampleRate: hardware.sampleRate, channels: hardware.channelCount)
+        else { return .failure("device reports no input format") }
 
         let writer = self.writer
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, when in

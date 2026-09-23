@@ -47,22 +47,34 @@ func fail(_ message: String, code: Int32 = 1) -> Never {
 }
 
 enum Launcher {
-    /// `rec start [--out DIR] [--detach]`
+    /// `rec start [--out DIR] [--mic NAME|UID] [--detach]`
     static func start(_ args: [String]) -> Never {
         var outDir: String?
         var detach = false
+        var micQuery = ProcessInfo.processInfo.environment["REC_MIC"].flatMap { $0.isEmpty ? nil : $0 }
         var it = args.makeIterator()
         while let arg = it.next() {
             switch arg {
             case "-o", "--out":
                 guard let value = it.next() else { fail("--out needs a directory", code: 64) }
                 outDir = value
+            case "-m", "--mic":
+                guard let value = it.next() else { fail("--mic needs a device name or UID", code: 64) }
+                micQuery = value
             case "-d", "--detach": detach = true
             default: fail("unknown option \(arg)", code: 64)
             }
         }
         if let running = PIDFile.read() {
             fail("already recording to \(running.dir) (pid \(running.pid)); run `rec stop` first")
+        }
+
+        // Resolve the mic to a UID now; the recorder stays pinned to that UID.
+        var micUID: String?
+        if let micQuery {
+            let resolved = AudioDevices.resolveInput(micQuery)
+            guard let input = resolved.input else { fail(resolved.error ?? "unknown mic") }
+            micUID = input.uid
         }
 
         let dir: URL
@@ -82,7 +94,7 @@ enum Launcher {
         guard let app = appBundle() else {
             // Development build outside Rec.app: TCC will attribute capture to the terminal.
             fputs("rec: not running from Rec.app; recording in-process (permissions belong to your terminal)\n", stderr)
-            Recorder(dir: dir).run()
+            Recorder(dir: dir, micUID: micUID).run()
         }
 
         // Launch through LaunchServices so Rec.app is its own "responsible process"
@@ -95,7 +107,7 @@ enum Launcher {
         }
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        open.arguments = ["-n", "-g", "--stdout", output, "--stderr", output, app.path, "--args", "_record", dir.path]
+        open.arguments = ["-n", "-g", "--stdout", output, "--stderr", output, app.path, "--args", "_record", dir.path] + (micUID.map { [$0] } ?? [])
         do {
             try open.run()
             open.waitUntilExit()
@@ -144,6 +156,21 @@ enum Launcher {
             print("rec: stopped, \(clock(duration)) recorded → \(recorder.dir)")
         } else {
             print("rec: stopped → \(recorder.dir)")
+        }
+        exit(0)
+    }
+
+    static func devices() -> Never {
+        let builtIn = AudioDevices.builtInInputUID()
+        let systemDefault = AudioDevices.defaultInputUID()
+        let inputs = AudioDevices.inputs()
+        let width = inputs.map(\.name.count).max() ?? 0
+        for input in inputs {
+            var tags: [String] = []
+            if input.uid == builtIn { tags.append("rec default") }
+            if input.uid == systemDefault { tags.append("system default") }
+            let name = input.name.padding(toLength: width, withPad: " ", startingAt: 0)
+            print("\(name)  \(input.uid)\(tags.isEmpty ? "" : "  (\(tags.joined(separator: ", ")))")")
         }
         exit(0)
     }

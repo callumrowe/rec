@@ -89,6 +89,38 @@ enum AudioDevices {
     }
 
     static func builtInInputUID() -> String? { builtIn(scope: kAudioObjectPropertyScopeInput) }
+
+    struct Input {
+        let uid: String
+        let name: String
+    }
+
+    /// Live devices with at least one input channel, excluding private aggregates.
+    static func inputs() -> [Input] {
+        all().compactMap { dev in
+            guard isAlive(dev), channels(dev, scope: kAudioObjectPropertyScopeInput) > 0,
+                  let uid = uid(dev), !uid.hasPrefix("rec-system-tap") else { return nil }
+            return Input(uid: uid, name: name(dev) ?? uid)
+        }
+    }
+
+    static func defaultInputUID() -> String? {
+        guard let dev = try? get(systemObject, kAudioHardwarePropertyDefaultInputDevice, initial: AudioObjectID(0)),
+              dev != kAudioObjectUnknown else { return nil }
+        return uid(dev)
+    }
+
+    /// Matches an exact UID, else a case-insensitive substring of the device name.
+    static func resolveInput(_ query: String) -> (input: Input?, error: String?) {
+        let inputs = inputs()
+        if let exact = inputs.first(where: { $0.uid == query }) { return (exact, nil) }
+        let matches = inputs.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        switch matches.count {
+        case 1: return (matches[0], nil)
+        case 0: return (nil, "no input device matches \"\(query)\"; see `rec devices`")
+        default: return (nil, "\"\(query)\" matches several devices (\(matches.map(\.name).joined(separator: ", "))); use the UID from `rec devices`")
+        }
+    }
     static func builtInOutputUID() -> String? { builtIn(scope: kAudioObjectPropertyScopeOutput) }
 
     static func defaultOutputUID() -> String? {
