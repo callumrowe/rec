@@ -74,10 +74,9 @@ final class Recorder {
         signal(SIGPIPE, SIG_IGN)
         setvbuf(stdout, nil, _IOLBF, 0)
         PIDFile.write(dir: dir)
-        say("rec: session \(dir.path)")
 
         if !requestMicrophoneAccess() {
-            say("⚠ microphone access denied: mic.wav will be silent. Allow Rec in System Settings › Privacy & Security › Microphone.")
+            say(Style.event("⚠ microphone access denied: mic.wav will be silent. Allow Rec in System Settings › Privacy & Security › Microphone."))
         }
         let builtInUID = AudioDevices.builtInInputUID() ?? "BuiltInMicrophoneDevice"
         let micUID = requestedMicUID ?? builtInUID
@@ -93,18 +92,25 @@ final class Recorder {
             micWriter = try TrackWriter(name: "mic", url: dir.appendingPathComponent("mic.wav"), t0: t0, log: log)
             systemWriter = try TrackWriter(name: "system", url: dir.appendingPathComponent("system.wav"), t0: t0, log: log)
         } catch {
-            say("✖ cannot create output files: \(error.localizedDescription)")
+            say(Style.event("✗ cannot create output files: \(error.localizedDescription)"))
             PIDFile.remove()
             exit(1)
         }
+
+        micName = AudioDevices.device(uid: micUID).flatMap(AudioDevices.name) ?? micUID
+        say("")
+        say("\(Style.strong("●", Style.accent)) \(Style.strong("REC", Style.accent))  \(Style.dim("mic + system audio"))")
+        say("  \(Style.dim("mic    "))  \(micName)  \(Style.faint(micUID))")
+        say("  \(Style.dim("session"))  \(Style.path(dir.path))")
+        say("  \(Style.dim("stop   "))  " + (interactive ? "ctrl-c" + Style.dim(" or ") : "") + "rec stop")
+        say("")
+        if interactive, Style.enabled { writeOut("\u{1B}[?25l") }
 
         system = SystemTap(writer: systemWriter)
         startSystem()
         mic = MicCapture(uid: micUID, writer: micWriter, log: log)
         mic.start()
         saveSession()
-        micName = AudioDevices.device(uid: micUID).flatMap(AudioDevices.name) ?? micUID
-        say("rec: recording (mic: \(micName) [\(micUID)]). Stop with `rec stop` or Ctrl-C.")
 
         let meterTimer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(meterTimer, forMode: .common)
@@ -183,7 +189,10 @@ final class Recorder {
                      hint: systemConfirmed ? "nothing is playing (capture was confirmed earlier, so the call may just be quiet)"
                          : "if audio is playing, Rec is missing System Audio Recording permission (System Settings › Privacy & Security › Screen & System Audio Recording)")
 
-        let line = "● \(clock(elapsed))   mic \(meterText(micMeter, "mic"))   sys \(meterText(systemMeter, "system"))"
+        let barWidth = ((terminalColumns() - 46) / 2).clamped(6, 24)
+        let dot = ticks % 2 == 0 ? Style.strong("●", Style.accent) : Style.faint("●")
+        let line = "\(dot) \(Style.bold(clock(elapsed)))   \(Style.dim("mic")) \(meterText(micMeter, "mic", barWidth))"
+            + "   \(Style.dim("sys")) \(meterText(systemMeter, "system", barWidth))"
         if interactive {
             eventsLock.withLock {
                 writeOut("\r\u{1B}[2K\(line)")
@@ -231,14 +240,20 @@ final class Recorder {
         }
     }
 
-    private func meterText(_ meter: TrackWriter.Meter, _ track: String) -> String {
-        guard let rms = meter.rms else { return "  -- no input --          " }
+    private func meterText(_ meter: TrackWriter.Meter, _ track: String, _ width: Int) -> String {
+        guard let rms = meter.rms else {
+            return Style.pad(Style.fg("no input", Style.red), width) + "        "
+        }
         let db = rms > 0 ? 20 * log10(rms) : -120
-        let width = 12
-        let filled = Int(((db + 70) / 70 * Double(width)).rounded()).clamped(0, width)
-        let bar = String(repeating: "█", count: filled) + String(repeating: "·", count: width - filled)
-        let flag = silenceWarned.contains(track) ? " SILENT" : ""
-        return String(format: "%@ %6.1f dB%@", bar, max(db, -99.9), flag)
+        let reading = String(format: "%4.0f dB", max(db, -99))
+        let text = silenceWarned.contains(track) ? Style.strong("silent", Style.red) + "  " : Style.dim(reading)
+        return Style.meter(db: db, width: width) + " " + text
+    }
+
+    private func terminalColumns() -> Int {
+        var size = winsize()
+        guard ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0, size.ws_col > 0 else { return 80 }
+        return Int(size.ws_col)
     }
 
     private func checkSilence(_ track: String, _ meter: TrackWriter.Meter, hint: String) {
@@ -278,10 +293,12 @@ final class Recorder {
             session.capturedFrames = ["mic": micResult.captured, "system": systemResult.captured]
         }
         saveSession()
-        if interactive { print("") }
-        say(String(format: "rec: stopped after %@ — mic.wav and system.wav are %lld frames (%.3fs) each",
-                   clock(duration), frames, Double(frames) / TrackWriter.sampleRate))
-        say("rec: \(dir.path)")
+        say("")
+        say("\(Style.strong("■", Style.accent)) \(Style.bold("stopped"))  \(clock(duration)) recorded")
+        say("  \(Style.dim("files  "))  mic.wav \(Style.faint("·")) system.wav \(Style.faint("·")) session.json  "
+            + Style.dim(String(format: "%lld frames each (%.3fs)", frames, Double(frames) / TrackWriter.sampleRate)))
+        say("  \(Style.dim("session"))  \(Style.path(dir.path))")
+        if interactive, Style.enabled { writeOut("\u{1B}[?25h") }
         PIDFile.remove()
         exit(0)
     }
@@ -294,7 +311,7 @@ final class Recorder {
         eventsLock.withLock {
             session?.events.append(.init(t: (t * 1000).rounded() / 1000, message: message))
         }
-        say("[\(clock(t))] \(message)")
+        say("\(Style.faint(clock(t)))  \(Style.event(message))")
     }
 
     private func say(_ message: String) {

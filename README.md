@@ -26,7 +26,10 @@ Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
 - **System audio:** a global mono `CATapDescription` process tap
   (`AudioHardwareCreateProcessTap`) inside a private aggregate device, clocked by
   the built-in speakers so it survives headphones coming and going.
-- **Mic choice:** `rec start` lists connected inputs. Enter accepts the default:
+- **Terminal output:** colour and the live meter only when stdout is a terminal;
+  `NO_COLOR=1` turns colour off, and logs/pipes get plain text. Session events in
+  `session.json` are always plain.
+- **Mic choice:** `rec start` lists connected inputs (↑/↓ or 1–9, Enter, Esc to cancel). Enter accepts the default:
   `REC_MIC` if it's connected, else the built-in mic, else (lid closed) the best
   external mic (USB, then Bluetooth). Picking the built-in mic with the lid closed
   asks for confirmation. Without a terminal, the default is used automatically.
