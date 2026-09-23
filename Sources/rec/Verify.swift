@@ -16,7 +16,8 @@ enum Verify {
         } else {
             fail("no sessions in \(Paths.recordingsRoot.path)")
         }
-        print("session: \(dir.path)")
+        print("\(Style.dim("session"))  \(Style.path(dir.path))")
+        print("")
         let mic: WAVData, system: WAVData
         do {
             mic = try WAVData(url: dir.appendingPathComponent("mic.wav"))
@@ -25,40 +26,51 @@ enum Verify {
             fail("cannot read WAVs: \(error.localizedDescription)")
         }
 
+        func row(_ pass: Bool?, _ label: String, _ detail: String) {
+            let mark = pass.map { $0 ? Style.ok : Style.bad } ?? Style.warn
+            print("\(mark) \(Style.bold(label.padding(toLength: 7, withPad: " ", startingAt: 0))) \(detail)")
+        }
+        let sep = Style.faint(" · ")
+
         var ok = true
         let rate = Double(mic.sampleRate)
         let sameLength = mic.samples.count == system.samples.count
-        print(String(format: "length: mic %d frames (%@), system %d frames (%@) → %@",
-                     mic.samples.count, clock(Double(mic.samples.count) / rate),
-                     system.samples.count, clock(Double(system.samples.count) / rate),
-                     sameLength ? "equal ✓" : "DIFFERENT ✗"))
+        if sameLength {
+            row(true, "length", "\(clock(Double(mic.samples.count) / rate))\(sep)\(Style.dim("\(mic.samples.count) frames on both tracks"))")
+        } else {
+            row(false, "length", String(format: "mic %d frames (%@), system %d frames (%@): tracks differ",
+                                        mic.samples.count, clock(Double(mic.samples.count) / rate),
+                                        system.samples.count, clock(Double(system.samples.count) / rate)))
+        }
         ok = ok && sameLength && mic.sampleRate == 16_000 && system.sampleRate == 16_000
 
         for (name, track) in [("mic", mic), ("system", system)] {
             let s = stats(track.samples, rate: rate)
             let good = s.silentFraction < 0.9
-            print(String(format: "%@: rms %.1f dBFS, peak %.1f dBFS, %.0f%% of seconds silent → %@",
-                         name.padding(toLength: 6, withPad: " ", startingAt: 0),
-                         s.rmsDB, s.peakDB, s.silentFraction * 100, good ? "non-silent ✓" : "SILENT ✗"))
+            let silent = String(format: "%.0f%% silent", s.silentFraction * 100)
+            row(good, name, String(format: "rms %.1f dBFS", s.rmsDB) + sep + String(format: "peak %.1f dBFS", s.peakDB)
+                + sep + (good ? Style.dim(silent) : Style.fg(silent, Style.red)))
             ok = ok && good
         }
 
         let lags = syncLags(system: system.samples, mic: mic.samples, rate: rate)
         let trusted = lags.filter { $0.correlation >= 0.3 }
-        for l in lags {
-            print(String(format: "  sync @%@: mic lags system by %+4.0f ms (r=%.2f)%@",
-                         clock(l.at), l.lagMs, l.correlation, l.correlation >= 0.3 ? "" : "  (weak, ignored)"))
-        }
         if trusted.count >= 2 {
             let spread = trusted.map(\.lagMs).max()! - trusted.map(\.lagMs).min()!
             let inSync = spread <= 40
-            print(String(format: "sync: lag varies by %.0f ms across %d windows → %@",
-                         spread, trusted.count, inSync ? "in sync ✓" : "DRIFTING ✗"))
+            row(inSync, "sync", String(format: "%@ %.0f ms across %d windows",
+                                       inSync ? "lag steady within" : "drifting: lag varies by", spread, trusted.count))
             ok = ok && inSync
         } else {
-            print("sync: not measurable (mic didn't pick up system audio, e.g. headphones). Check by ear.")
+            row(nil, "sync", "not measurable " + Style.dim("(mic didn't hear system audio, e.g. headphones); check by ear"))
         }
-        print(ok ? "verdict: PASS" : "verdict: FAIL")
+        for l in lags {
+            let weak = l.correlation < 0.3
+            let text = String(format: "%@  mic lags by %+4.0f ms  r=%.2f", clock(l.at), l.lagMs, l.correlation)
+            print("          " + (weak ? Style.faint(text + "  weak, ignored") : Style.dim(text)))
+        }
+        print("")
+        print(ok ? Style.paint(" PASS ", "1", "7", Style.green.fg) : Style.paint(" FAIL ", "1", "7", Style.red.fg))
         exit(ok ? 0 : 1)
     }
 

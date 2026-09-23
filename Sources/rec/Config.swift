@@ -100,7 +100,7 @@ enum ConfigCommand {
         }
         let current = Config.load()
         if show {
-            guard let current else { print("rec: not configured; run `rec config`"); exit(1) }
+            guard let current else { print("\(Style.warn) not configured; run `rec config`"); exit(1) }
             print("vault: \(current.vault)")
             print("transcripts: \(current.transcriptionsDir.path)")
             print("model: \(current.model ?? "v2")")
@@ -128,7 +128,7 @@ enum ConfigCommand {
     static func firstRun() -> Config? {
         print("rec transcribes each recording into an Obsidian vault. Which one? (you can change it later with `rec config`)")
         guard let path = promptForVault(current: nil) else {
-            print("rec: transcription is off until you run `rec config`")
+            print("\(Style.warn) transcription is off until you run `rec config`")
             return nil
         }
         let config = Config(vault: path, model: nil)
@@ -140,8 +140,8 @@ enum ConfigCommand {
         do {
             let created = try Vault.ensureTranscriptionsDir(config)
             try config.save()
-            print("rec: vault \(config.vault)")
-            print("rec: \(created ? "created" : "✓") \(config.transcriptionsDir.path)")
+            print("  \(Style.dim("vault      "))  \(Style.path(config.vault))")
+            print("  \(Style.dim("transcripts"))  \(Style.path(config.transcriptionsDir.path))  \(Style.dim(created ? "created" : "exists"))")
         } catch {
             fail("cannot set up \(config.transcriptionsDir.path): \(error.localizedDescription)")
         }

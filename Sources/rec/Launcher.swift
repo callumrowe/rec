@@ -42,7 +42,7 @@ func isAlive(_ pid: pid_t) -> Bool {
 }
 
 func fail(_ message: String, code: Int32 = 1) -> Never {
-    fputs("rec: \(message)\n", stderr)
+    fputs("\(Style.bad) \(message)\n", stderr)
     exit(code)
 }
 
@@ -68,7 +68,7 @@ enum Launcher {
             }
         }
         if let running = PIDFile.read() {
-            fail("already recording to \(running.dir) (pid \(running.pid)); run `rec stop` first")
+            fail("already recording to \(Style.path(running.dir)) (pid \(running.pid)); run `rec stop` first")
         }
 
         // Choose the mic once, now; the recorder stays pinned to its UID.
@@ -99,7 +99,7 @@ enum Launcher {
 
         guard let app = appBundle() else {
             // Development build outside Rec.app: TCC will attribute capture to the terminal.
-            fputs("rec: not running from Rec.app; recording in-process (permissions belong to your terminal)\n", stderr)
+            fputs("\(Style.warn) not running from Rec.app; recording in-process (permissions belong to your terminal)\n", stderr)
             Recorder(dir: dir, micUID: micUID).run()
         }
 
@@ -111,9 +111,13 @@ enum Launcher {
         if !FileManager.default.fileExists(atPath: output) {
             FileManager.default.createFile(atPath: output, contents: nil)
         }
+        // LaunchServices doesn't pass our environment along; forward colour preferences.
+        let env = ProcessInfo.processInfo.environment
+        let forwarded = ["NO_COLOR", "COLORTERM", "TERM"].flatMap { key in env[key].map { ["--env", "\(key)=\($0)"] } ?? [] }
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        open.arguments = ["-n", "-g", "--stdout", output, "--stderr", output, app.path, "--args", "_record", dir.path, micUID]
+        open.arguments = ["-n", "-g"] + forwarded
+            + ["--stdout", output, "--stderr", output, app.path, "--args", "_record", dir.path, micUID]
         do {
             try open.run()
             open.waitUntilExit()
@@ -123,15 +127,31 @@ enum Launcher {
         guard open.terminationStatus == 0 else { fail("open exited with \(open.terminationStatus)") }
 
         guard let recorder = waitForRecorder(dir: dir, timeout: 10) else {
-            fail("recorder did not start; see \(output)")
+            fail("recorder did not start; see \(Style.path(output))")
         }
         if detach {
-            print("rec: recording → \(dir.path) (pid \(recorder.pid)), log at \(output)")
-            print("rec: stop with `rec stop`")
+            print("\(Style.strong("●", Style.accent)) \(Style.bold("recording")) in the background  \(Style.dim("pid \(recorder.pid)"))")
+            print("  \(Style.dim("session"))  \(Style.path(dir.path))")
+            print("  \(Style.dim("log    "))  \(Style.path(output))")
+            print("  \(Style.dim("stop   "))  rec stop")
             exit(0)
         }
 
         // Stay in the foreground until the recorder exits; Ctrl-C asks it to stop cleanly.
+        // Don't echo "^C" over the recorder's meter line, and put the terminal back on exit.
+        var savedTerm = termios()
+        let haveTerm = isatty(STDIN_FILENO) != 0 && tcgetattr(STDIN_FILENO, &savedTerm) == 0
+        if haveTerm {
+            var quiet = savedTerm
+            quiet.c_lflag &= ~tcflag_t(ECHOCTL | ECHO)
+            tcsetattr(STDIN_FILENO, TCSANOW, &quiet)
+        }
+        func finish() -> Never {
+            if haveTerm { tcsetattr(STDIN_FILENO, TCSANOW, &savedTerm) }
+            if Style.enabled { fputs("\u{1B}[?25h", stdout); fflush(stdout) }
+            exit(0)
+        }
+
         var sources: [DispatchSourceSignal] = []
         for sig in [SIGINT, SIGTERM, SIGHUP] {
             signal(sig, SIG_IGN)
@@ -145,7 +165,7 @@ enum Launcher {
         timer.setEventHandler {
             guard !isAlive(recorder.pid) else { return }
             Transcriber.launchInBackground(dir: dir.path)
-            withExtendedLifetime(sources) { exit(0) }
+            withExtendedLifetime(sources) { finish() }
         }
         timer.resume()
         dispatchMain()
@@ -158,14 +178,33 @@ enum Launcher {
         while isAlive(recorder.pid), Date() < deadline { usleep(100_000) }
         if isAlive(recorder.pid) { fail("recorder (pid \(recorder.pid)) did not exit within 15s") }
         let sessionURL = URL(fileURLWithPath: recorder.dir).appendingPathComponent("session.json")
+        let stopped = "\(Style.strong("■", Style.accent)) \(Style.bold("stopped"))"
         if let data = try? Data(contentsOf: sessionURL),
            let session = try? JSONDecoder().decode(SessionInfo.self, from: data),
            let duration = session.durationSeconds {
-            print("rec: stopped, \(clock(duration)) recorded → \(recorder.dir)")
+            print("\(stopped)  \(clock(duration)) recorded")
         } else {
-            print("rec: stopped → \(recorder.dir)")
+            print(stopped)
         }
+        print("  \(Style.dim("session"))  \(Style.path(recorder.dir))")
         Transcriber.launchInBackground(dir: recorder.dir)
+        exit(0)
+    }
+
+    /// `rec open`: shows the recordings folder in Finder.
+    static func openRecordings() -> Never {
+        let dir = Paths.recordingsRoot
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let open = Process()
+        open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        open.arguments = [dir.path]
+        do {
+            try open.run()
+            open.waitUntilExit()
+        } catch {
+            fail("could not run open: \(error.localizedDescription)")
+        }
+        guard open.terminationStatus == 0 else { fail("open exited with \(open.terminationStatus)") }
         exit(0)
     }
 
@@ -175,14 +214,19 @@ enum Launcher {
         let lidClosed = isLidClosed() == true
         let inputs = AudioDevices.inputs()
         let recDefault = defaultMic(inputs).map { inputs[$0].uid }
-        let width = inputs.map(\.name.count).max() ?? 0
+        let nameWidth = inputs.map(\.name.count).max() ?? 0
+        let kindWidth = inputs.map(\.kind.count).max() ?? 0
+        guard !inputs.isEmpty else { print(Style.dim("no input devices connected")); exit(0) }
         for input in inputs {
-            var tags = [input.kind]
-            if input.uid == builtIn, lidClosed { tags.append("lid closed, muted") }
-            if input.uid == recDefault { tags.append("rec default") }
-            if input.uid == systemDefault { tags.append("system default") }
-            let name = input.name.padding(toLength: width, withPad: " ", startingAt: 0)
-            print("\(name)  \(input.uid)  (\(tags.joined(separator: ", ")))")
+            let isDefault = input.uid == recDefault
+            let mark = isDefault ? Style.strong("❯", Style.accent) : " "
+            let name = Style.pad(isDefault ? Style.bold(input.name) : input.name, nameWidth)
+            var tags: [String] = []
+            if isDefault { tags.append(Style.fg("rec default", Style.accent)) }
+            if input.uid == systemDefault { tags.append(Style.fg("system default", Style.blue)) }
+            if input.uid == builtIn, lidClosed { tags.append(Style.fg("lid closed, muted", Style.yellow)) }
+            print("\(mark) \(name)  \(Style.dim(Style.pad(input.kind, kindWidth)))  \(tags.joined(separator: Style.faint(" · ")))")
+            print("  \(Style.faint(input.uid))")
         }
         exit(0)
     }
@@ -216,42 +260,84 @@ enum Launcher {
         let lidClosed = isLidClosed() == true
         func mutedBuiltIn(_ input: AudioDevices.Input) -> Bool { lidClosed && input.uid == builtIn }
 
-        guard interactive else {
+        guard interactive, let term = RawTerminal() else {
             let input = inputs[defaultIndex]
-            print("rec: mic: \(input.name)")
-            if mutedBuiltIn(input) { fputs("rec: ⚠ the lid is closed, so the built-in mic will record silence\n", stderr) }
+            print("\(Style.ok) \(Style.dim("mic")) \(Style.bold(input.name))")
+            if mutedBuiltIn(input) { fputs("\(Style.warn) the lid is closed, so the built-in mic will record silence\n", stderr) }
             return input
+        }
+        return pickMic(inputs, defaultIndex: defaultIndex, muted: mutedBuiltIn, term: term)
+    }
+
+    /// Arrow-key list: ↑/↓ (or j/k, Tab) to move, 1–9 to jump, Enter to choose,
+    /// Esc/q/Ctrl-C to cancel. Collapses to a one-line summary once chosen.
+    private static func pickMic(_ inputs: [AudioDevices.Input], defaultIndex: Int,
+                                muted: (AudioDevices.Input) -> Bool, term: RawTerminal) -> AudioDevices.Input {
+        var cursor = defaultIndex
+        var confirming = false
+        var drawnLines = 0
+        let nameWidth = inputs.map(\.name.count).max() ?? 0
+
+        func rewind() -> String {
+            (drawnLines > 1 ? "\u{1B}[\(drawnLines - 1)A" : "") + "\r\u{1B}[J"
+        }
+        func draw() {
+            var lines = [Style.bold("Which mic?") + "  " + Style.dim("rec records this plus all system audio")]
+            for (i, input) in inputs.enumerated() {
+                let selected = i == cursor
+                let pointer = selected ? Style.strong("❯", Style.accent) : " "
+                let name = Style.pad(selected ? Style.strong(input.name, Style.accent) : input.name, nameWidth)
+                var notes = [Style.dim(input.kind)]
+                if i == defaultIndex { notes.append(Style.dim("default")) }
+                if muted(input) { notes.append(Style.fg("lid closed, muted", Style.yellow)) }
+                lines.append("\(pointer) \(name)  \(notes.joined(separator: Style.faint(" · ")))")
+            }
+            if confirming {
+                lines.append("\(Style.warn) The lid is closed, so this mic will record silence. Use it anyway? \(Style.dim("y/N"))")
+            } else if inputs.count > 1 {
+                lines.append(Style.faint("↑↓ move · enter choose · 1–\(min(inputs.count, 9)) jump · esc cancel"))
+            } else {
+                lines.append(Style.faint("enter choose · esc cancel"))
+            }
+            term.write(rewind() + lines.joined(separator: "\n"))
+            drawnLines = lines.count
+        }
+        func done(_ summary: String) {
+            term.write(rewind())
+            term.restore()
+            print(summary)
         }
 
-        print("Mic for this recording:")
-        let width = inputs.map(\.name.count).max() ?? 0
-        for (i, input) in inputs.enumerated() {
-            var notes = [input.kind]
-            if mutedBuiltIn(input) { notes.append("lid closed, muted") }
-            let name = input.name.padding(toLength: width, withPad: " ", startingAt: 0)
-            print("  \(i == defaultIndex ? "›" : " ") \(i + 1)) \(name)  \(notes.joined(separator: " · "))")
-        }
+        draw()
         while true {
-            print("Choose [\(defaultIndex + 1)]: ", terminator: "")
-            fflush(stdout)
-            guard let line = readLine() else { return inputs[defaultIndex] }
-            let text = line.trimmingCharacters(in: .whitespaces)
-            let index: Int
-            if text.isEmpty {
-                index = defaultIndex
-            } else if let n = Int(text), inputs.indices.contains(n - 1) {
-                index = n - 1
-            } else {
-                print("Enter 1–\(inputs.count), or press Enter for \(defaultIndex + 1).")
+            let key = term.readKey()
+            if confirming {
+                confirming = false
+                if case .char(let c) = key, c == "y" || c == "Y" {
+                    done("\(Style.warn) \(Style.dim("mic")) \(Style.bold(inputs[cursor].name))  \(Style.fg("lid closed", Style.yellow))")
+                    return inputs[cursor]
+                }
+                draw()
                 continue
             }
-            let input = inputs[index]
-            if mutedBuiltIn(input) {
-                print("The lid is closed, so the built-in mic will record silence. Use it anyway? [y/N]: ", terminator: "")
-                fflush(stdout)
-                guard readLine()?.lowercased().hasPrefix("y") == true else { continue }
+            switch key {
+            case .up, .char("k"): cursor = (cursor - 1 + inputs.count) % inputs.count
+            case .down, .char("j"), .char("\t"): cursor = (cursor + 1) % inputs.count
+            case .char(let c) where c.wholeNumberValue.map { (1...inputs.count).contains($0) } == true:
+                cursor = c.wholeNumberValue! - 1
+            case .enter:
+                if muted(inputs[cursor]) {
+                    confirming = true
+                } else {
+                    done("\(Style.ok) \(Style.dim("mic")) \(Style.bold(inputs[cursor].name))")
+                    return inputs[cursor]
+                }
+            case .cancel, .char("q"):
+                done("\(Style.dim("○ cancelled"))")
+                exit(130)
+            default: break
             }
-            return input
+            draw()
         }
     }
 
@@ -262,20 +348,28 @@ enum Launcher {
             if interactive {
                 _ = ConfigCommand.firstRun()
             } else {
-                print("rec: no Obsidian vault configured, so this recording won't be transcribed (see `rec config`)")
+                print("\(Style.warn) no Obsidian vault configured, so this recording won't be transcribed (see `rec config`)")
             }
             return
         }
         if let problem = Vault.check(config.vault) {
-            fputs("rec: ⚠ \(problem); transcription will fail until you run `rec config`\n", stderr)
+            fputs("\(Style.warn) \(problem); transcription will fail until you run `rec config`\n", stderr)
         } else if (try? Vault.ensureTranscriptionsDir(config)) == nil {
-            fputs("rec: ⚠ cannot create \(config.transcriptionsDir.path)\n", stderr)
+            fputs("\(Style.warn) cannot create \(Style.path(config.transcriptionsDir.path))\n", stderr)
         }
     }
 
     static func status() -> Never {
-        guard let recorder = PIDFile.read() else { print("rec: not recording"); exit(1) }
-        print("rec: recording → \(recorder.dir) (pid \(recorder.pid))")
+        guard let recorder = PIDFile.read() else { print(Style.dim("○ not recording")); exit(1) }
+        let sessionURL = URL(fileURLWithPath: recorder.dir).appendingPathComponent("session.json")
+        let session = (try? Data(contentsOf: sessionURL)).flatMap { try? JSONDecoder().decode(SessionInfo.self, from: $0) }
+        let elapsed = session.map { "  " + clock(Date().timeIntervalSince1970 - Double($0.startEpochMs) / 1000) } ?? ""
+        print("\(Style.strong("●", Style.accent)) \(Style.bold("recording"))\(elapsed)  \(Style.dim("pid \(recorder.pid)"))")
+        if let uid = session?.micDeviceUID {
+            let name = AudioDevices.device(uid: uid).flatMap(AudioDevices.name) ?? uid
+            print("  \(Style.dim("mic    "))  \(name)")
+        }
+        print("  \(Style.dim("session"))  \(Style.path(recorder.dir))")
         exit(0)
     }
 

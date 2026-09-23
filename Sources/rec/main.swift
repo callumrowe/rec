@@ -7,6 +7,7 @@ usage: rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach]
        rec status                         show whether a recording is running
        rec devices                        list input devices for --mic
        rec verify [DIR]                   check a session (default: latest) for length, silence, sync
+       rec open                           open the recordings folder in Finder
        rec transcribe [DIR]               transcribe a session (default: latest) into the Obsidian vault
        rec config [--vault PATH] [--model v2|v3] [--show]
                                           choose the Obsidian vault (and Parakeet model) for transcripts
@@ -28,6 +29,7 @@ case "stop": Launcher.stop()
 case "status": Launcher.status()
 case "devices": Launcher.devices()
 case "verify": Verify.run(Array(args.dropFirst()))
+case "open": Launcher.openRecordings()
 case "transcribe": Transcriber.run(Array(args.dropFirst()))
 case "_transcribe" where args.count == 2: Transcriber.run([args[1]], background: true)
 case "config": ConfigCommand.run(Array(args.dropFirst()))

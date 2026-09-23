@@ -21,7 +21,7 @@ enum Transcriber {
         // One transcription per session at a time (`rec stop` and a foreground `rec start` may both launch one).
         let lockFD = open(dir.appendingPathComponent(".transcribe.lock").path, O_CREAT | O_RDWR, 0o644)
         guard lockFD >= 0, flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
-            print("rec: \(dir.path) is already being transcribed")
+            print("\(Style.warn) \(Style.path(dir.path)) is already being transcribed")
             exit(0)
         }
 
@@ -42,11 +42,11 @@ enum Transcriber {
         Task {
             do {
                 let note = try await transcribe(dir: dir, config: config)
-                say("rec: transcript → \(note.path)")
+                say("\(Style.ok) transcript → \(Style.path(note.path))")
                 if background { notify("Transcript saved", note.deletingPathExtension().lastPathComponent) }
                 exit(0)
             } catch {
-                say("rec: transcription failed: \(error.localizedDescription) (details in \(log))")
+                say("\(Style.bad) transcription failed: \(error.localizedDescription) (details in \(log))")
                 if background { notify("Transcription failed", "\(error.localizedDescription) — see transcribe.log") }
                 exit(1)
             }
@@ -59,7 +59,7 @@ enum Transcriber {
     /// than Rec.app so writing into the vault uses the terminal's file access.
     static func launchInBackground(dir: String) {
         guard Config.load() != nil else {
-            print("rec: not transcribing; run `rec config` to choose an Obsidian vault, then `rec transcribe`")
+            print("\(Style.warn) not transcribing; run `rec config` to choose an Obsidian vault, then `rec transcribe`")
             return
         }
         let log = URL(fileURLWithPath: dir).appendingPathComponent("transcribe.log").path
@@ -80,9 +80,9 @@ enum Transcriber {
         var pid: pid_t = 0
         let status = posix_spawn(&pid, exe, &actions, &attr, argv, environ)
         if status == 0 {
-            print("rec: transcribing in the background (log: \(log))")
+            print("  \(Style.dim("transcript"))  in the background, log at \(Style.path(log))")
         } else {
-            fputs("rec: could not start transcription (\(String(cString: strerror(status)))); run `rec transcribe \(dir)`\n", stderr)
+            fputs("\(Style.bad) could not start transcription (\(String(cString: strerror(status)))); run `rec transcribe \(dir)`\n", stderr)
         }
     }
 
@@ -107,10 +107,10 @@ enum Transcriber {
         let session = (try? Data(contentsOf: dir.appendingPathComponent("session.json")))
             .flatMap { try? JSONDecoder().decode(SessionInfo.self, from: $0) }
         let started = Date()
-        say("rec: transcribing \(dir.path)")
+        say("transcribing \(dir.path)")
 
         let version: AsrModelVersion = config.model == "v3" ? .v3 : .v2
-        say("rec: loading Parakeet \(config.model ?? "v2") (the first run downloads the models)")
+        say("loading Parakeet \(config.model ?? "v2") (the first run downloads the models)")
         let asr = AsrManager(config: .default)
         try await asr.loadModels(try await AsrModels.downloadAndLoad(version: version))
 
@@ -120,15 +120,15 @@ enum Transcriber {
             return buildWordTimings(from: result.tokenTimings ?? [])
         }
         let micWords = try await words(micURL)
-        say("rec: mic: \(micWords.count) words")
+        say("mic: \(micWords.count) words")
         let systemWords = try await words(systemURL)
-        say("rec: system: \(systemWords.count) words")
+        say("system: \(systemWords.count) words")
         await asr.cleanup()
 
         var speakers: [Transcript.SpeakerSpan] = []
         if !systemWords.isEmpty {
             do {
-                say("rec: finding speakers in system audio")
+                say("finding speakers in system audio")
                 let diarizer = OfflineDiarizerManager(config: OfflineDiarizerConfig())
                 try await diarizer.prepareModels()
                 speakers = try await diarizer.process(systemURL).segments.map {
@@ -137,7 +137,7 @@ enum Transcriber {
                 for s in speakers { fputs(String(format: "diarization: %@ %.2f–%.2f\n", s.id, s.start, s.end), stderr) }
             } catch {
                 // Still worth a transcript; remote speech is just labelled "Them".
-                say("rec: ⚠ diarization failed (\(error.localizedDescription)); labelling remote speech \"Them\"")
+                say("\(Style.warn) diarization failed (\(error.localizedDescription)); labelling remote speech \"Them\"")
             }
         }
 
@@ -155,7 +155,7 @@ enum Transcriber {
         try Vault.ensureTranscriptionsDir(config)
         let url = noteURL(in: config.transcriptionsDir, start: startDate, session: dir.path)
         try note.write(to: url, atomically: true, encoding: .utf8)
-        say(String(format: "rec: %d turns, %d echo words dropped from the mic, %.0fs", transcript.utterances.count,
+        say(String(format: "%d turns, %d echo words dropped from the mic, %.0fs", transcript.utterances.count,
                      transcript.droppedEcho, Date().timeIntervalSince(started)))
         return url
     }
