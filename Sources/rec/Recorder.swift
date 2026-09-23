@@ -15,6 +15,7 @@ struct SessionInfo: Codable {
     var sampleRate = Int(TrackWriter.sampleRate)
     var files = ["mic": "mic.wav", "system": "system.wav"]
     var micDeviceUID: String
+    var micName: String?
     var systemClockDeviceUID: String?
     var end: String?
     var durationSeconds: Double?
@@ -98,6 +99,7 @@ final class Recorder {
         }
 
         micName = AudioDevices.device(uid: micUID).flatMap(AudioDevices.name) ?? micUID
+        eventsLock.withLock { session.micName = micName }
         say("")
         say("\(Style.strong("●", Style.accent)) \(Style.strong("REC", Style.accent))  \(Style.dim("mic + system audio"))")
         say("  \(Style.dim("mic    "))  \(micName)  \(Style.faint(micUID))")

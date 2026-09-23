@@ -74,12 +74,6 @@ enum Verify {
         exit(ok ? 0 : 1)
     }
 
-    private static func latestSession() -> URL? {
-        let items = (try? FileManager.default.contentsOfDirectory(at: Paths.recordingsRoot, includingPropertiesForKeys: nil)) ?? []
-        return items.filter { FileManager.default.fileExists(atPath: $0.appendingPathComponent("session.json").path) }
-            .max { $0.lastPathComponent < $1.lastPathComponent }
-    }
-
     private static func stats(_ x: [Float], rate: Double) -> (rmsDB: Double, peakDB: Double, silentFraction: Double) {
         func db(_ v: Double) -> Double { v > 0 ? 20 * log10(v) : -120 }
         var sum = 0.0, peak: Float = 0
@@ -139,4 +133,11 @@ enum Verify {
         guard va > 1e-12, vb > 1e-12 else { return 0 }
         return cov / (va * vb).squareRoot()
     }
+}
+
+/// The newest session directory under ~/Recordings/rec.
+func latestSession() -> URL? {
+    let items = (try? FileManager.default.contentsOfDirectory(at: Paths.recordingsRoot, includingPropertiesForKeys: nil)) ?? []
+    return items.filter { FileManager.default.fileExists(atPath: $0.appendingPathComponent("session.json").path) }
+        .max { $0.lastPathComponent < $1.lastPathComponent }
 }
