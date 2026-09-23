@@ -138,7 +138,8 @@ enum Launcher {
         }
 
         // Stay in the foreground until the recorder exits; Ctrl-C asks it to stop cleanly.
-        // Don't echo "^C" over the recorder's meter line, and put the terminal back on exit.
+        // Don't echo "^C" over the recorder's meter line, and put the terminal back
+        // before transcribing here. `rec stop` leaves the transcription to this terminal.
         var savedTerm = termios()
         let haveTerm = isatty(STDIN_FILENO) != 0 && tcgetattr(STDIN_FILENO, &savedTerm) == 0
         if haveTerm {
@@ -146,10 +147,11 @@ enum Launcher {
             quiet.c_lflag &= ~tcflag_t(ECHOCTL | ECHO)
             tcsetattr(STDIN_FILENO, TCSANOW, &quiet)
         }
+        try? "\(getpid())\n".write(to: dir.appendingPathComponent(".attached.pid"), atomically: true, encoding: .utf8)
         func finish() -> Never {
             if haveTerm { tcsetattr(STDIN_FILENO, TCSANOW, &savedTerm) }
             if Style.enabled { fputs("\u{1B}[?25h", stdout); fflush(stdout) }
-            exit(0)
+            Transcriber.runAttached(dir: dir.path)
         }
 
         var sources: [DispatchSourceSignal] = []
@@ -164,7 +166,6 @@ enum Launcher {
         timer.schedule(deadline: .now(), repeating: 0.2)
         timer.setEventHandler {
             guard !isAlive(recorder.pid) else { return }
-            Transcriber.launchInBackground(dir: dir.path)
             withExtendedLifetime(sources) { finish() }
         }
         timer.resume()
@@ -187,8 +188,20 @@ enum Launcher {
             print(stopped)
         }
         print("  \(Style.dim("session"))  \(Style.path(recorder.dir))")
-        Transcriber.launchInBackground(dir: recorder.dir)
+        if let owner = attachedLauncher(dir: recorder.dir) {
+            print("  \(Style.dim("transcript"))  in the terminal running `rec start` \(Style.faint("pid \(owner)"))")
+        } else {
+            Transcriber.launchInBackground(dir: recorder.dir)
+        }
         exit(0)
+    }
+
+    /// The foreground `rec start` for this session, which transcribes it in its own terminal.
+    private static func attachedLauncher(dir: String) -> pid_t? {
+        let url = URL(fileURLWithPath: dir).appendingPathComponent(".attached.pid")
+        guard let text = try? String(contentsOf: url, encoding: .utf8),
+              let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)), isAlive(pid) else { return nil }
+        return pid
     }
 
     /// `rec open`: shows the recordings folder in Finder.

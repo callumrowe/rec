@@ -18,8 +18,10 @@ question; --yes takes the default. The mic is pinned for the whole session and n
 follows the system default input.
 
 Sessions go to ~/Recordings/rec/<timestamp>/ as mic.wav, system.wav (16 kHz mono) and session.json.
-When a recording stops it is transcribed in the background (FluidAudio, on-device) into
+When a recording stops it is transcribed (FluidAudio, on-device) into
 <vault>/transcriptions/<yyyy-MM-dd HH-mm> Transcript.md. `rec start` asks for the vault on first use.
+In the terminal running `rec start` the transcription runs right there with live progress
+(Ctrl-C again cancels it); with --detach it runs in the background.
 """
 
 let args = Array(CommandLine.arguments.dropFirst())

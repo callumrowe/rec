@@ -67,6 +67,11 @@ enum Style {
         return strong(subject, color) + " " + String(s[colon.upperBound...])
     }
 
+    /// The text without escapes, for logs.
+    static func plain(_ s: String) -> String {
+        s.replacingOccurrences(of: "\u{1B}\\[[0-9;?]*[A-Za-z]", with: "", options: .regularExpression)
+    }
+
     /// Pads by visible width (ignores escapes).
     static func pad(_ s: String, _ width: Int) -> String {
         s + String(repeating: " ", count: max(0, width - visibleWidth(s)))

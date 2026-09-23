@@ -27,8 +27,11 @@ enum Transcriber {
 
         // FluidAudio and Core ML write diagnostics straight to stdout/stderr; send
         // those to the log and keep the terminal for our own progress lines.
+        // (Style decides on colour from stdout, so settle that while it's the terminal.)
         let log = dir.appendingPathComponent("transcribe.log").path
+        var terminal: Int32?
         if !background {
+            _ = Style.enabled
             let fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0o644)
             if fd >= 0 {
                 fflush(stdout)
@@ -38,30 +41,69 @@ enum Transcriber {
                 close(fd)
             }
         }
+        progress = TranscribeProgress(terminal: terminal)
+        func done(_ code: Int32) -> Never {
+            progress.finish()
+            // The marker a foreground `rec start` left for `rec stop`; this process is its exec.
+            let marker = dir.appendingPathComponent(".attached.pid")
+            if (try? String(contentsOf: marker, encoding: .utf8)) == "\(getpid())\n" {
+                try? FileManager.default.removeItem(at: marker)
+            }
+            exit(code)
+        }
+
+        // In a terminal, Ctrl-C cancels. Closing the terminal doesn't: the note
+        // still gets written, with progress going to the log.
+        if !background {
+            signal(SIGHUP, SIG_IGN)
+            for sig in [SIGINT, SIGTERM] {
+                signal(sig, SIG_IGN)
+                let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+                source.setEventHandler {
+                    progress.cancel("\(Style.dim("○ transcription cancelled; finish it with")) rec transcribe \(Style.path(dir.path))")
+                    done(130)
+                }
+                source.resume()
+                signalSources.append(source)
+            }
+        }
 
         Task {
             do {
                 let note = try await transcribe(dir: dir, config: config)
-                say("\(Style.ok) transcript → \(Style.path(note.path))")
+                progress.line("\(Style.ok) transcript → \(Style.path(note.path))")
                 if background { notify("Transcript saved", note.deletingPathExtension().lastPathComponent) }
-                exit(0)
+                done(0)
             } catch {
-                say("\(Style.bad) transcription failed: \(error.localizedDescription) (details in \(log))")
+                progress.cancel("\(Style.bad) transcription failed: \(error.localizedDescription) (details in \(Style.path(log)))")
                 if background { notify("Transcription failed", "\(error.localizedDescription) — see transcribe.log") }
-                exit(1)
+                done(1)
             }
         }
         dispatchMain()
+    }
+
+    /// After a foreground `rec start`: becomes `rec transcribe DIR` in this same
+    /// process, so the terminal shows progress and the prompt comes back when
+    /// the note is written.
+    static func runAttached(dir: String) -> Never {
+        guard vaultConfigured() else { exit(0) }
+        print("")
+        fflush(stdout)
+        for sig in [SIGINT, SIGTERM, SIGHUP] { signal(sig, SIG_DFL) }
+        let exe = executablePath()
+        let argv: [UnsafeMutablePointer<CChar>?] = [strdup(exe), strdup("transcribe"), strdup(dir), nil]
+        execv(exe, argv)
+        fputs("\(Style.bad) could not run \(exe) (\(String(cString: strerror(errno))))\n", stderr)
+        launchInBackground(dir: dir)
+        exit(1)
     }
 
     /// Starts `rec _transcribe DIR` in its own session so it outlives this
     /// terminal, logging to `<DIR>/transcribe.log`. It runs from the CLI rather
     /// than Rec.app so writing into the vault uses the terminal's file access.
     static func launchInBackground(dir: String) {
-        guard Config.load() != nil else {
-            print("\(Style.warn) not transcribing; run `rec config` to choose an Obsidian vault, then `rec transcribe`")
-            return
-        }
+        guard vaultConfigured() else { return }
         let log = URL(fileURLWithPath: dir).appendingPathComponent("transcribe.log").path
         var actions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&actions)
@@ -86,15 +128,14 @@ enum Transcriber {
         }
     }
 
-    /// The terminal, when a foreground run has pointed stdout at the log.
-    nonisolated(unsafe) private static var terminal: Int32?
-
-    /// A progress line, to the log and (in the foreground) the terminal.
-    private static func say(_ message: String) {
-        print(message)
-        fflush(stdout)
-        if let terminal { _ = (message + "\n").withCString { write(terminal, $0, strlen($0)) } }
+    private static func vaultConfigured() -> Bool {
+        guard Config.load() == nil else { return true }
+        print("\(Style.warn) not transcribing; run `rec config` to choose an Obsidian vault, then `rec transcribe`")
+        return false
     }
+
+    nonisolated(unsafe) private static var progress = TranscribeProgress(terminal: nil)
+    nonisolated(unsafe) private static var signalSources: [DispatchSourceSignal] = []
 
     // MARK: - Pipeline
 
@@ -107,37 +148,43 @@ enum Transcriber {
         let session = (try? Data(contentsOf: dir.appendingPathComponent("session.json")))
             .flatMap { try? JSONDecoder().decode(SessionInfo.self, from: $0) }
         let started = Date()
-        say("transcribing \(dir.path)")
+        let audio = session?.durationSeconds.map { "  " + Style.dim("\(shortDuration($0)) of audio") } ?? ""
+        progress.line("\(Style.strong("◆", Style.accent)) \(Style.bold("transcribing"))  \(Style.path(dir.path))\(audio)")
 
         let version: AsrModelVersion = config.model == "v3" ? .v3 : .v2
-        say("loading Parakeet \(config.model ?? "v2") (the first run downloads the models)")
+        let model = "Parakeet \(config.model ?? "v2")"
+        progress.begin("loading \(model) \(Style.dim("(the first run downloads the models)"))")
         let asr = AsrManager(config: .default)
         try await asr.loadModels(try await AsrModels.downloadAndLoad(version: version))
+        progress.end(Style.event("✓ model: \(model) loaded"))
 
         func words(_ url: URL) async throws -> [WordTiming] {
             var state = TdtDecoderState.make(decoderLayers: version.decoderLayers)
             let result = try await asr.transcribe(url, decoderState: &state)
             return buildWordTimings(from: result.tokenTimings ?? [])
         }
+        progress.begin("transcribing mic")
         let micWords = try await words(micURL)
-        say("mic: \(micWords.count) words")
+        progress.end(Style.event("✓ mic: \(micWords.count) words"))
+        progress.begin("transcribing system audio")
         let systemWords = try await words(systemURL)
-        say("system: \(systemWords.count) words")
+        progress.end(Style.event("✓ system: \(systemWords.count) words"))
         await asr.cleanup()
 
         var speakers: [Transcript.SpeakerSpan] = []
         if !systemWords.isEmpty {
+            progress.begin("finding speakers in system audio")
             do {
-                say("finding speakers in system audio")
                 let diarizer = OfflineDiarizerManager(config: OfflineDiarizerConfig())
                 try await diarizer.prepareModels()
                 speakers = try await diarizer.process(systemURL).segments.map {
                     .init(id: $0.speakerId, start: Double($0.startTimeSeconds), end: Double($0.endTimeSeconds))
                 }
                 for s in speakers { fputs(String(format: "diarization: %@ %.2f–%.2f\n", s.id, s.start, s.end), stderr) }
+                progress.end(Style.event("✓ speakers: \(Set(speakers.map(\.id)).count) in system audio"))
             } catch {
                 // Still worth a transcript; remote speech is just labelled "Them".
-                say("\(Style.warn) diarization failed (\(error.localizedDescription)); labelling remote speech \"Them\"")
+                progress.end(Style.event("⚠ diarization failed (\(error.localizedDescription)); labelling remote speech \"Them\""))
             }
         }
 
@@ -155,8 +202,9 @@ enum Transcriber {
         try Vault.ensureTranscriptionsDir(config)
         let url = noteURL(in: config.transcriptionsDir, start: startDate, session: dir.path)
         try note.write(to: url, atomically: true, encoding: .utf8)
-        say(String(format: "%d turns, %d echo words dropped from the mic, %.0fs", transcript.utterances.count,
-                     transcript.droppedEcho, Date().timeIntervalSince(started)))
+        progress.line(Style.dim(String(format: "  %d turns, %d echo words dropped from the mic, %@ in all",
+                                       transcript.utterances.count, transcript.droppedEcho,
+                                       shortDuration(Date().timeIntervalSince(started)))))
         return url
     }
 
@@ -195,6 +243,122 @@ enum Transcriber {
 struct TranscribeError: LocalizedError {
     let errorDescription: String?
     init(_ message: String) { errorDescription = message }
+}
+
+/// Progress lines go to the log (unstyled) and, in the foreground, to the
+/// terminal, where the running step is a spinner with its elapsed time that
+/// turns into a summary line when the step ends.
+final class TranscribeProgress: @unchecked Sendable {
+    private let terminal: Int32?
+    private let live: Bool
+    private let lock = NSLock()
+    private var step: (label: String, start: Date)?
+    private var stepDrawn = false
+    private var frame = 0
+    private var timer: DispatchSourceTimer?
+    private var savedTerm: termios?
+    private static let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    init(terminal: Int32?) {
+        self.terminal = terminal
+        live = terminal.map { isatty($0) != 0 } == true && Style.enabled
+        guard live else { return }
+        // Keystrokes (and "^C") would land in the middle of the spinner line.
+        var term = termios()
+        if isatty(STDIN_FILENO) != 0, tcgetattr(STDIN_FILENO, &term) == 0 {
+            savedTerm = term
+            term.c_lflag &= ~tcflag_t(ECHOCTL | ECHO)
+            tcsetattr(STDIN_FILENO, TCSANOW, &term)
+        }
+        show("\u{1B}[?25l")
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: 0.1)
+        timer.setEventHandler { [weak self] in self?.tick() }
+        timer.resume()
+        self.timer = timer
+    }
+
+    func line(_ message: String) {
+        lock.withLock {
+            log(message)
+            show(clearStep() + message + "\n" + drawStep())
+        }
+    }
+
+    func begin(_ label: String) {
+        lock.withLock {
+            log(label)
+            step = (label, Date())
+            if live { show(clearStep() + drawStep()) } else { show(label + "\n") }
+        }
+    }
+
+    /// Ends the running step with a summary and how long it took.
+    func end(_ summary: String) {
+        let took = lock.withLock { () -> TimeInterval in
+            defer { step = nil }
+            return step.map { Date().timeIntervalSince($0.start) } ?? 0
+        }
+        line(summary + "  " + Style.faint(shortDuration(took)))
+    }
+
+    /// Drops the running step, if any, for a final message.
+    func cancel(_ message: String) {
+        lock.withLock { step = nil }
+        line(message)
+    }
+
+    /// Stops the spinner and gives the terminal back.
+    func finish() {
+        lock.withLock {
+            timer?.cancel()
+            timer = nil
+            step = nil
+            show(clearStep())
+            if live { show("\u{1B}[?25h") }
+            if var term = savedTerm { tcsetattr(STDIN_FILENO, TCSANOW, &term) }
+            savedTerm = nil
+        }
+    }
+
+    private func tick() {
+        lock.withLock {
+            guard step != nil else { return }
+            frame += 1
+            show(clearStep() + drawStep())
+        }
+    }
+
+    private func drawStep() -> String {
+        guard live, let step else { return "" }
+        stepDrawn = true
+        let glyph = Style.fg(Self.spinner[frame % Self.spinner.count], Style.accent)
+        return "\(glyph) \(step.label)  \(Style.faint(shortDuration(Date().timeIntervalSince(step.start))))"
+    }
+
+    private func clearStep() -> String {
+        guard stepDrawn else { return "" }
+        stepDrawn = false
+        return "\r\u{1B}[2K"
+    }
+
+    private func show(_ s: String) {
+        guard let terminal, !s.isEmpty else { return }
+        _ = s.withCString { write(terminal, $0, strlen($0)) }
+    }
+
+    private func log(_ message: String) {
+        print(Style.plain(message))
+        fflush(stdout)
+    }
+}
+
+/// "42s", "3m 05s", "1h 02m".
+func shortDuration(_ seconds: TimeInterval) -> String {
+    let s = Int(max(0, seconds))
+    if s < 60 { return "\(s)s" }
+    if s < 3600 { return String(format: "%dm %02ds", s / 60, s % 60) }
+    return String(format: "%dh %02dm", s / 3600, (s / 60) % 60)
 }
 
 // MARK: - Merging
