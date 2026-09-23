@@ -187,6 +187,23 @@ enum Launcher {
         exit(0)
     }
 
+    /// `rec open`: shows the recordings folder in Finder.
+    static func openRecordings() -> Never {
+        let dir = Paths.recordingsRoot
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let open = Process()
+        open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        open.arguments = [dir.path]
+        do {
+            try open.run()
+            open.waitUntilExit()
+        } catch {
+            fail("could not run open: \(error.localizedDescription)")
+        }
+        guard open.terminationStatus == 0 else { fail("open exited with \(open.terminationStatus)") }
+        exit(0)
+    }
+
     static func devices() -> Never {
         let builtIn = AudioDevices.builtInInputUID()
         let systemDefault = AudioDevices.defaultInputUID()

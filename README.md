@@ -11,6 +11,7 @@ rec start --mic streamcam    # skip the question (name substring or UID); --yes 
 rec devices                  # list inputs, their UIDs, and which one rec would default to
 rec stop
 rec verify [SESSION_DIR]     # length / silence / sync check (default: latest session)
+rec open                     # open ~/Recordings/rec in Finder
 ```
 
 Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
