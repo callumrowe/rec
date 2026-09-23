@@ -93,6 +93,20 @@ enum AudioDevices {
     struct Input {
         let uid: String
         let name: String
+        let transport: UInt32
+
+        var kind: String {
+            switch transport {
+            case kAudioDeviceTransportTypeBuiltIn: "built-in"
+            case kAudioDeviceTransportTypeUSB: "USB"
+            case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: "Bluetooth"
+            case kAudioDeviceTransportTypeVirtual, kAudioDeviceTransportTypeAggregate,
+                 kAudioDeviceTransportTypeAutoAggregate: "virtual"
+            case kAudioDeviceTransportTypeContinuityCaptureWired,
+                 kAudioDeviceTransportTypeContinuityCaptureWireless: "iPhone"
+            default: "other"
+            }
+        }
     }
 
     /// Live devices with at least one input channel, excluding private aggregates.
@@ -100,7 +114,8 @@ enum AudioDevices {
         all().compactMap { dev in
             guard isAlive(dev), channels(dev, scope: kAudioObjectPropertyScopeInput) > 0,
                   let uid = uid(dev), !uid.hasPrefix("rec-system-tap") else { return nil }
-            return Input(uid: uid, name: name(dev) ?? uid)
+            let transport = (try? get(dev, kAudioDevicePropertyTransportType, initial: UInt32(0))) ?? 0
+            return Input(uid: uid, name: name(dev) ?? uid, transport: transport)
         }
     }
 

@@ -47,11 +47,12 @@ func fail(_ message: String, code: Int32 = 1) -> Never {
 }
 
 enum Launcher {
-    /// `rec start [--out DIR] [--mic NAME|UID] [--detach]`
+    /// `rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach]`
     static func start(_ args: [String]) -> Never {
         var outDir: String?
         var detach = false
-        var micQuery = ProcessInfo.processInfo.environment["REC_MIC"].flatMap { $0.isEmpty ? nil : $0 }
+        var skipPicker = false
+        var micQuery: String?
         var it = args.makeIterator()
         while let arg = it.next() {
             switch arg {
@@ -61,6 +62,7 @@ enum Launcher {
             case "-m", "--mic":
                 guard let value = it.next() else { fail("--mic needs a device name or UID", code: 64) }
                 micQuery = value
+            case "-y", "--yes": skipPicker = true
             case "-d", "--detach": detach = true
             default: fail("unknown option \(arg)", code: 64)
             }
@@ -69,12 +71,15 @@ enum Launcher {
             fail("already recording to \(running.dir) (pid \(running.pid)); run `rec stop` first")
         }
 
-        // Resolve the mic to a UID now; the recorder stays pinned to that UID.
-        var micUID: String?
+        // Choose the mic once, now; the recorder stays pinned to its UID.
+        let micUID: String
         if let micQuery {
             let resolved = AudioDevices.resolveInput(micQuery)
             guard let input = resolved.input else { fail(resolved.error ?? "unknown mic") }
             micUID = input.uid
+        } else {
+            let interactive = !skipPicker && isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0
+            micUID = chooseMic(interactive: interactive).uid
         }
 
         let dir: URL
@@ -107,7 +112,7 @@ enum Launcher {
         }
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        open.arguments = ["-n", "-g", "--stdout", output, "--stderr", output, app.path, "--args", "_record", dir.path] + (micUID.map { [$0] } ?? [])
+        open.arguments = ["-n", "-g", "--stdout", output, "--stderr", output, app.path, "--args", "_record", dir.path, micUID]
         do {
             try open.run()
             open.waitUntilExit()
@@ -163,16 +168,87 @@ enum Launcher {
     static func devices() -> Never {
         let builtIn = AudioDevices.builtInInputUID()
         let systemDefault = AudioDevices.defaultInputUID()
+        let lidClosed = isLidClosed() == true
         let inputs = AudioDevices.inputs()
+        let recDefault = defaultMic(inputs).map { inputs[$0].uid }
         let width = inputs.map(\.name.count).max() ?? 0
         for input in inputs {
-            var tags: [String] = []
-            if input.uid == builtIn { tags.append("rec default") }
+            var tags = [input.kind]
+            if input.uid == builtIn, lidClosed { tags.append("lid closed, muted") }
+            if input.uid == recDefault { tags.append("rec default") }
             if input.uid == systemDefault { tags.append("system default") }
             let name = input.name.padding(toLength: width, withPad: " ", startingAt: 0)
-            print("\(name)  \(input.uid)\(tags.isEmpty ? "" : "  (\(tags.joined(separator: ", ")))")")
+            print("\(name)  \(input.uid)  (\(tags.joined(separator: ", ")))")
         }
         exit(0)
+    }
+
+    /// REC_MIC if it's connected; otherwise the built-in mic, unless the lid is
+    /// closed (which mutes it), in which case the best external mic.
+    private static func defaultMic(_ inputs: [AudioDevices.Input]) -> Int? {
+        if let pref = ProcessInfo.processInfo.environment["REC_MIC"], !pref.isEmpty,
+           let match = AudioDevices.resolveInput(pref).input,
+           let i = inputs.firstIndex(where: { $0.uid == match.uid }) {
+            return i
+        }
+        let lidClosed = isLidClosed() == true
+        func rank(_ input: AudioDevices.Input) -> Int {
+            switch input.kind {
+            case "built-in": lidClosed ? 8 : 0
+            case "USB": 1
+            case "Bluetooth": 2
+            case "iPhone": 5
+            case "virtual": 9
+            default: 3
+            }
+        }
+        return inputs.indices.min { (rank(inputs[$0]), $0) < (rank(inputs[$1]), $1) }
+    }
+
+    private static func chooseMic(interactive: Bool) -> AudioDevices.Input {
+        let inputs = AudioDevices.inputs()
+        guard let defaultIndex = defaultMic(inputs) else { fail("no input devices connected") }
+        let builtIn = AudioDevices.builtInInputUID()
+        let lidClosed = isLidClosed() == true
+        func mutedBuiltIn(_ input: AudioDevices.Input) -> Bool { lidClosed && input.uid == builtIn }
+
+        guard interactive else {
+            let input = inputs[defaultIndex]
+            print("rec: mic: \(input.name)")
+            if mutedBuiltIn(input) { fputs("rec: ⚠ the lid is closed, so the built-in mic will record silence\n", stderr) }
+            return input
+        }
+
+        print("Mic for this recording:")
+        let width = inputs.map(\.name.count).max() ?? 0
+        for (i, input) in inputs.enumerated() {
+            var notes = [input.kind]
+            if mutedBuiltIn(input) { notes.append("lid closed, muted") }
+            let name = input.name.padding(toLength: width, withPad: " ", startingAt: 0)
+            print("  \(i == defaultIndex ? "›" : " ") \(i + 1)) \(name)  \(notes.joined(separator: " · "))")
+        }
+        while true {
+            print("Choose [\(defaultIndex + 1)]: ", terminator: "")
+            fflush(stdout)
+            guard let line = readLine() else { return inputs[defaultIndex] }
+            let text = line.trimmingCharacters(in: .whitespaces)
+            let index: Int
+            if text.isEmpty {
+                index = defaultIndex
+            } else if let n = Int(text), inputs.indices.contains(n - 1) {
+                index = n - 1
+            } else {
+                print("Enter 1–\(inputs.count), or press Enter for \(defaultIndex + 1).")
+                continue
+            }
+            let input = inputs[index]
+            if mutedBuiltIn(input) {
+                print("The lid is closed, so the built-in mic will record silence. Use it anyway? [y/N]: ", terminator: "")
+                fflush(stdout)
+                guard readLine()?.lowercased().hasPrefix("y") == true else { continue }
+            }
+            return input
+        }
     }
 
     static func status() -> Never {

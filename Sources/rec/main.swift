@@ -1,15 +1,17 @@
 import Foundation
 
 let usage = """
-usage: rec start [--out DIR] [--mic NAME|UID] [--detach]
+usage: rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach]
                                           record mic + system audio until `rec stop` / Ctrl-C
        rec stop                           stop the running recording
        rec status                         show whether a recording is running
        rec devices                        list input devices for --mic
        rec verify [DIR]                   check a session (default: latest) for length, silence, sync
 
-The mic defaults to the built-in MacBook mic. --mic (or REC_MIC) picks another by name
-substring or UID; either way it is pinned and never follows the system default input.
+`rec start` asks which mic to use. Enter accepts the default: REC_MIC if it's connected,
+else the built-in mic, else (lid closed) the best external mic. --mic NAME|UID skips the
+question; --yes takes the default. The mic is pinned for the whole session and never
+follows the system default input.
 
 Sessions go to ~/Recordings/rec/<timestamp>/ as mic.wav, system.wav (16 kHz mono) and session.json.
 """

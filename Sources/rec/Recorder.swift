@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CoreAudio
 import Foundation
@@ -49,6 +50,15 @@ final class Recorder {
     private var silenceWarned: Set<String> = []
     private var ticks = 0
     private var lastLidClosed: Bool?
+
+    // Startup check: prove both capture paths work in the first few seconds.
+    private var micName = ""
+    private var micPeakRMS = 0.0
+    private var micChecked = false
+    private var chime: NSSound?
+    private var chimePlayedAt: Date?
+    private var systemConfirmed = false
+    private var systemCheckFailed = false
     private var stopping = false
     private var keepAlive: [AnyObject] = []
 
@@ -93,7 +103,7 @@ final class Recorder {
         mic = MicCapture(uid: micUID, writer: micWriter, log: log)
         mic.start()
         saveSession()
-        let micName = AudioDevices.device(uid: micUID).flatMap(AudioDevices.name) ?? micUID
+        micName = AudioDevices.device(uid: micUID).flatMap(AudioDevices.name) ?? micUID
         say("rec: recording (mic: \(micName) [\(micUID)]). Stop with `rec stop` or Ctrl-C.")
 
         let meterTimer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
@@ -164,13 +174,15 @@ final class Recorder {
             else if lastLidClosed != nil { log("mic: MacBook lid opened") }
             lastLidClosed = lidClosed
         }
-        checkSilence("mic", micMeter,
-                     hint: lidClosed ? "the MacBook lid is closed, which mutes the built-in mic"
-                         : "check Rec has Microphone permission (System Settings › Privacy & Security › Microphone) and the mic isn't muted")
-        checkSilence("system", systemMeter,
-                     hint: "if audio is playing, Rec is missing System Audio Recording permission (System Settings › Privacy & Security › Screen & System Audio Recording)")
-
+        let micHint = lidClosed ? "the MacBook lid is closed, which mutes the built-in mic"
+            : "check Rec has Microphone permission (System Settings › Privacy & Security › Microphone) and the mic isn't muted"
         let elapsed = hostSeconds(from: t0, to: mach_absolute_time())
+        startupCheck(micMeter, systemMeter, elapsed: elapsed, micHint: micHint)
+        checkSilence("mic", micMeter, hint: micHint)
+        checkSilence("system", systemMeter,
+                     hint: systemConfirmed ? "nothing is playing (capture was confirmed earlier, so the call may just be quiet)"
+                         : "if audio is playing, Rec is missing System Audio Recording permission (System Settings › Privacy & Security › Screen & System Audio Recording)")
+
         let line = "● \(clock(elapsed))   mic \(meterText(micMeter, "mic"))   sys \(meterText(systemMeter, "system"))"
         if interactive {
             eventsLock.withLock {
@@ -179,6 +191,43 @@ final class Recorder {
             }
         } else if ticks % 10 == 0 {
             say(line)
+        }
+    }
+
+    /// Mic: after 4s, is the device delivering anything above digital silence?
+    /// (A live mic's noise floor is well above the threshold, so no need to speak.)
+    /// System: a tap without permission returns silence, indistinguishable from
+    /// nothing playing, so play a short chime and check the tap captures it.
+    private func startupCheck(_ mic: TrackWriter.Meter, _ systemMeter: TrackWriter.Meter,
+                              elapsed: Double, micHint: String) {
+        if !micChecked {
+            micPeakRMS = max(micPeakRMS, mic.rms ?? 0)
+            if elapsed >= 4 {
+                micChecked = true
+                if micPeakRMS >= Self.silenceThreshold {
+                    log(String(format: "✓ mic: %@ is live (%.0f dB)", micName, 20 * log10(micPeakRMS)))
+                } else if mic.secondsSinceLastBuffer.isInfinite {
+                    log("✗ mic: no audio arriving from \(micName): \(micHint)")
+                } else {
+                    log("✗ mic: \(micName) is sending pure silence: \(micHint)")
+                }
+            }
+        }
+
+        if !systemConfirmed, (systemMeter.rms ?? 0) >= Self.silenceThreshold {
+            systemConfirmed = true
+            log(chimePlayedAt == nil ? "✓ system audio: capturing" : "✓ system audio: capture confirmed (heard test chime)")
+        }
+        if !systemConfirmed, chimePlayedAt == nil, system.isRunning, systemMeter.secondsSinceLastBuffer < 1 {
+            chime = NSSound(named: "Tink")
+            chime?.volume = 0.3
+            chime?.play()
+            chimePlayedAt = Date()
+        }
+        if let chimePlayedAt, !systemConfirmed, !systemCheckFailed, Date().timeIntervalSince(chimePlayedAt) > 3 {
+            systemCheckFailed = true
+            log("✗ system audio: test chime was not captured. Rec is probably missing System Audio Recording permission "
+                + "(System Settings › Privacy & Security › Screen & System Audio Recording). Stop, fix it, and start again.")
         }
     }
 
