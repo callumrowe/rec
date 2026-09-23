@@ -34,8 +34,13 @@ Obsidian knows about, or takes a path; the folder must contain `.obsidian/`),
 creates `<vault>/transcriptions/` and saves the choice to
 `~/.config/rec/config.json`. `rec config` changes it later.
 
-When a recording stops (Ctrl-C or `rec stop`) it is transcribed in the
-background and a notification says when the note is ready:
+When a recording stops it is transcribed. If `rec start` is running in the
+foreground, the transcription happens in that terminal (whether you pressed Ctrl-C
+there or ran `rec stop` elsewhere): it shows each step with a spinner and
+elapsed time, and the prompt comes back once the note is written. Ctrl-C again
+cancels it (`rec transcribe` picks it up later); closing the terminal doesn't.
+A `--detach`ed recording is transcribed in the background instead, and a
+notification says when the note is ready. Either way the note is
 `<vault>/transcriptions/2026-09-23 14-30 Transcript.md`, with YAML frontmatter
 (date, duration, mic, speakers, session path, model, `tags: [transcript]`)
 and one line per turn:
