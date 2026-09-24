@@ -1,7 +1,7 @@
 import FluidAudio
 import Foundation
 
-/// `rec transcribe [DIR] [--engine parakeet|whisper] [--channel mic|system|both]`:
+/// `rec transcribe [DIR] [--engine parakeet|whisper] [--channel mic|system|both] [--split-gap SECONDS] [--no-vocab]`:
 /// ASR on the tracks, speaker diarization on system.wav, merged on the shared
 /// timeline into `<DIR>/transcript.<engine>.json` and, for the default run
 /// (Parakeet, both tracks), a note in `<vault>/transcriptions/`.
@@ -13,6 +13,10 @@ enum Transcriber {
     struct Options {
         var engine = Engine.parakeet
         var channel = Channel.both
+        /// A pause longer than this (seconds) starts a new line.
+        var splitGap = 0.6
+        /// `~/.config/rec/vocab.json`: Parakeet keyword boosting, then alias → canonical on every engine.
+        var vocabulary = true
         /// The note is the regular product; other engines and single tracks are experiments.
         var writesNote: Bool { engine == .parakeet && channel == .both }
     }
@@ -35,6 +39,11 @@ enum Transcriber {
                 let v = value(arg)
                 guard let c = Channel(rawValue: v) else { fail("--channel must be mic, system or both, not \(v)", code: 64) }
                 options.channel = c
+            case "--split-gap":
+                let v = value(arg)
+                guard let g = Double(v), g > 0 else { fail("--split-gap must be a number of seconds above 0, not \(v)", code: 64) }
+                options.splitGap = g
+            case "--no-vocab": options.vocabulary = false
             case _ where arg.hasPrefix("-"): fail("unknown option \(arg)\n\(usage)", code: 64)
             case _ where path == nil: path = arg
             default: fail("unexpected argument \(arg)\n\(usage)", code: 64)
@@ -190,7 +199,8 @@ enum Transcriber {
         let which = options.writesNote ? "" : "  " + Style.dim("\(options.engine.rawValue), \(options.channel.rawValue)")
         progress.line("\(Style.strong("◆", Style.accent)) \(Style.bold("transcribing"))  \(Style.path(dir.path))\(audio)\(which)")
 
-        let engine = options.engine.make(config: config)
+        let vocabulary = options.vocabulary ? try Vocabulary.load() : nil
+        let engine = options.engine.make(config: config, vocabulary: vocabulary)
         progress.begin("loading \(engine.label) \(Style.dim("(the first run downloads the models)"))")
         try await engine.load()
         let loaded = Date()
@@ -208,6 +218,16 @@ enum Transcriber {
             modelLoadSeconds: loaded.timeIntervalSince(started),
             transcribeSeconds: Date().timeIntervalSince(loaded),
             wallClockSeconds: Date().timeIntervalSince(started))
+        if let vocabulary {
+            var replaced = 0
+            for (channel, list) in words {
+                let result = vocabulary.canonicalize(list)
+                words[channel] = result.words
+                replaced += result.replaced
+            }
+            progress.line(Style.event("✓ vocabulary: \(vocabulary.terms.count) terms, \(replaced) aliases replaced")
+                          + "  " + Style.faint(Vocabulary.url.path))
+        }
         let micWords = words[.mic] ?? []
         let systemWords = words[.system] ?? []
 
@@ -228,11 +248,11 @@ enum Transcriber {
             }
         }
 
-        let transcript = Transcript(mic: micWords, system: systemWords, speakers: speakers)
+        let transcript = Transcript(mic: micWords, system: systemWords, speakers: speakers, splitGap: options.splitGap)
         let json = dir.appendingPathComponent("transcript.\(engine.id).json")
         try TranscriptFile(
             engine: engine.id, model: engine.model, channel: options.channel.rawValue, session: dir.path,
-            created: Date(), timing: timing,
+            created: Date(), splitGap: options.splitGap, vocabulary: vocabulary?.terms.map(\.text), timing: timing,
             words: .init(mic: words[.mic].map(TranscriptFile.words), system: words[.system].map(TranscriptFile.words)),
             speakers: speakers.map { .init(id: $0.id, start: $0.start, end: $0.end) },
             utterances: transcript.utterances.map { .init(speaker: $0.speaker, start: $0.start, end: $0.end, text: $0.text) }
@@ -434,11 +454,11 @@ struct Transcript {
     /// Mic words dropped because they were the speakers leaking into the mic.
     private(set) var droppedEcho = 0
 
-    init(mic: [Word], system: [Word], speakers: [SpeakerSpan]) {
+    init(mic: [Word], system: [Word], speakers: [SpeakerSpan], splitGap: Double = 0.6) {
         // Remote speech: cut into sentences (or pause-separated fragments), then
         // give each the diarized speaker most of its words fall in, so a label
         // can't flip mid-sentence. Speakers are numbered in order of first speech.
-        let phrases = Self.turns(system.map { ($0, "") }, pause: 0.6, sentencePause: -1)
+        let phrases = Self.turns(system.map { ($0, "") }, gap: 0.6, sentenceAfter: 0)
         var ids = phrases.map { Self.dominantSpeaker($0.words, speakers) }
         for i in ids.indices where ids[i] == nil {
             ids[i] = i > 0 ? ids[i - 1] : ids.lazy.compactMap { $0 }.first
@@ -451,7 +471,7 @@ struct Transcript {
         let labelled = zip(phrases, ids).flatMap { phrase, id in
             phrase.words.map { ($0, id.flatMap { remote[$0] } ?? "Them") }
         }
-        let remoteTurns = Self.turns(labelled)
+        let remoteTurns = Self.turns(labelled, gap: splitGap)
 
         // Without headphones the mic also hears the call. Drop mic words the
         // system track said at the same moment, plus short misheard runs
@@ -473,9 +493,9 @@ struct Transcript {
             i = j
         }
         droppedEcho = echo.filter { $0 }.count
-        let micTurns = Self.turns(zip(mic, echo).compactMap { $1 ? nil : ($0, "Me") })
+        let micTurns = Self.turns(zip(mic, echo).compactMap { $1 ? nil : ($0, "Me") }, gap: splitGap)
 
-        utterances = (micTurns + remoteTurns)
+        utterances = Self.interleaved(micTurns + remoteTurns)
             .sorted { $0.words[0].startTime < $1.words[0].startTime }
             .map { Utterance(speaker: $0.speaker, start: $0.words[0].startTime, end: $0.words[$0.words.count - 1].endTime,
                              text: $0.words.map(\.word).joined(separator: " ")) }
@@ -499,16 +519,16 @@ struct Transcript {
 
     private struct Turn { let speaker: String; var words: [Word] }
 
-    /// Splits one track into turns: on speaker change, a long pause, or a
-    /// shorter pause after a sentence ends. Long monologues break at sentences.
-    private static func turns(_ words: [(Word, String)], pause: Double = 2, sentencePause: Double = 0.8) -> [Turn] {
+    /// Splits one track into turns from its word timings: on speaker change, a
+    /// pause longer than `gap`, or a sentence end once the turn is over
+    /// `sentenceAfter` seconds long.
+    private static func turns(_ words: [(Word, String)], gap: Double, sentenceAfter: Double = 20) -> [Turn] {
         var result: [Turn] = []
         for (word, speaker) in words {
             if var last = result.last, last.speaker == speaker, let prev = last.words.last {
-                let gap = word.startTime - prev.endTime
                 let sentenceEnded = prev.word.last.map { ".?!".contains($0) } ?? false
-                let long = word.startTime - last.words[0].startTime > 45
-                if gap < pause && !(sentenceEnded && (gap > sentencePause || long)) {
+                let long = prev.endTime - last.words[0].startTime > sentenceAfter
+                if word.startTime - prev.endTime <= gap && !(sentenceEnded && long) {
                     last.words.append(word)
                     result[result.count - 1] = last
                     continue
@@ -517,6 +537,30 @@ struct Transcript {
             result.append(Turn(speaker: speaker, words: [word]))
         }
         return result
+    }
+
+    /// Cuts a turn wherever another speaker's turn starts inside it, so that
+    /// sorted by start time no line runs across someone else's. Cutting makes
+    /// new starts that may land inside other turns, so repeat until none do.
+    private static func interleaved(_ turns: [Turn]) -> [Turn] {
+        var turns = turns
+        while true {
+            let starts = turns.map { ($0.speaker, $0.words[0].startTime) }
+            var cut = false
+            turns = turns.flatMap { turn -> [Turn] in
+                let others = starts.filter { $0.0 != turn.speaker }.map(\.1)
+                var pieces = [Turn(speaker: turn.speaker, words: [turn.words[0]])]
+                for (prev, word) in zip(turn.words, turn.words.dropFirst()) {
+                    if others.contains(where: { prev.startTime < $0 && $0 <= word.startTime }) {
+                        pieces.append(Turn(speaker: turn.speaker, words: []))
+                        cut = true
+                    }
+                    pieces[pieces.count - 1].words.append(word)
+                }
+                return pieces
+            }
+            if !cut { return turns }
+        }
     }
 
     private static func normalized(_ word: String) -> String {
