@@ -31,7 +31,10 @@ struct TranscriptFile: Codable {
     var timing: Timing
     var words: Words
     var speakers: [Speaker]
+    /// Paragraphs, as in the note.
     var utterances: [Utterance]
+    /// The same speech cut at every pause over `splitGap`.
+    var segments: [Utterance]?
 
     static func words(_ words: [Word]) -> [TimedWord] {
         words.map { TimedWord(word: $0.word, start: rounded($0.startTime), end: rounded($0.endTime)) }
