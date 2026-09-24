@@ -7,26 +7,20 @@ enum Style {
         let env = ProcessInfo.processInfo.environment
         return isatty(STDOUT_FILENO) != 0 && env["NO_COLOR"] == nil && env["TERM"] != "dumb"
     }()
-    static let trueColor: Bool = {
-        let v = ProcessInfo.processInfo.environment["COLORTERM"]?.lowercased() ?? ""
-        return v.contains("truecolor") || v.contains("24bit")
-    }()
 
+    /// One of the terminal's 16 ANSI colours. The terminal theme picks the
+    /// actual shade, so it stays legible on dark and light backgrounds alike;
+    /// fixed RGB greys didn't (dark grey vanished on a dark background).
     struct Color {
-        let r: Int, g: Int, b: Int
-        let ansi256: Int
-
-        var fg: String { trueColor ? "38;2;\(r);\(g);\(b)" : "38;5;\(ansi256)" }
+        let code: Int
+        var fg: String { "\(code)" }
     }
 
-    // A small palette: one accent, a traffic-light scale, and two greys.
-    static let accent = Color(r: 255, g: 95, b: 135, ansi256: 204)   // rec-light pink-red
-    static let green = Color(r: 95, g: 215, b: 135, ansi256: 78)
-    static let yellow = Color(r: 245, g: 200, b: 90, ansi256: 221)
-    static let red = Color(r: 255, g: 95, b: 95, ansi256: 203)
-    static let blue = Color(r: 120, g: 170, b: 255, ansi256: 111)
-    static let muted = Color(r: 128, g: 128, b: 140, ansi256: 244)
-    static let faint = Color(r: 70, g: 70, b: 80, ansi256: 238)
+    static let accent = Color(code: 35)  // magenta
+    static let green = Color(code: 32)
+    static let yellow = Color(code: 33)
+    static let red = Color(code: 31)
+    static let blue = Color(code: 34)
 
     static func paint(_ s: String, _ codes: String...) -> String {
         guard enabled, !s.isEmpty else { return s }
@@ -35,8 +29,10 @@ enum Style {
 
     static func fg(_ s: String, _ c: Color) -> String { paint(s, c.fg) }
     static func bold(_ s: String) -> String { paint(s, "1") }
-    static func dim(_ s: String) -> String { paint(s, muted.fg) }
-    static func faint(_ s: String) -> String { paint(s, faint.fg) }
+    /// Secondary text. Not greyed out: it stays in the terminal's normal
+    /// text colour so it's always readable; hierarchy comes from colour and bold.
+    static func dim(_ s: String) -> String { s }
+    static func faint(_ s: String) -> String { s }
     static func strong(_ s: String, _ c: Color) -> String { paint(s, "1", c.fg) }
 
     static let ok = strong("✓", green)
