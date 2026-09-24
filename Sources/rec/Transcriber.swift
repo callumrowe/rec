@@ -255,7 +255,8 @@ enum Transcriber {
             created: Date(), splitGap: options.splitGap, vocabulary: vocabulary?.terms.map(\.text), timing: timing,
             words: .init(mic: words[.mic].map(TranscriptFile.words), system: words[.system].map(TranscriptFile.words)),
             speakers: speakers.map { .init(id: $0.id, start: $0.start, end: $0.end) },
-            utterances: transcript.utterances.map { .init(speaker: $0.speaker, start: $0.start, end: $0.end, text: $0.text) }
+            utterances: transcript.utterances.map { .init(speaker: $0.speaker, start: $0.start, end: $0.end, text: $0.text) },
+            segments: transcript.segments.map { .init(speaker: $0.speaker, start: $0.start, end: $0.end, text: $0.text) }
         ).write(to: json)
 
         var note: URL?
@@ -263,30 +264,36 @@ enum Transcriber {
             let startDate = session.map { Date(timeIntervalSince1970: Double($0.startEpochMs) / 1000) }
                 ?? (try? FileManager.default.attributesOfItem(atPath: micURL.path)[.creationDate] as? Date)
                 ?? Date()
-            let micName = session.map { s in
-                s.micName ?? AudioDevices.device(uid: s.micDeviceUID).flatMap(AudioDevices.name) ?? s.micDeviceUID
-            }
             let markdown = transcript.markdown(
-                start: startDate, duration: session?.durationSeconds, mic: micName, session: dir.path, model: engine.model)
+                start: startDate, duration: session?.durationSeconds, model: engine.model)
             try Vault.ensureTranscriptionsDir(config)
-            let url = noteURL(in: config.transcriptionsDir, start: startDate, session: dir.path)
+            let url = noteURL(in: config.transcriptionsDir, start: startDate, session: dir)
             try markdown.write(to: url, atomically: true, encoding: .utf8)
+            try? url.lastPathComponent.write(to: dir.appendingPathComponent(noteRecord), atomically: true, encoding: .utf8)
             note = url
         }
-        progress.line(Style.dim(String(format: "  %d turns, %d echo words dropped from the mic, %@ in all",
-                                       transcript.utterances.count, transcript.droppedEcho,
+        progress.line(Style.dim(String(format: "  %d paragraphs (%d segments), %d echo words dropped from the mic, %@ in all",
+                                       transcript.utterances.count, transcript.segments.count, transcript.droppedEcho,
                                        shortDuration(Date().timeIntervalSince(started)))))
         for line in TranscriptFile.timingSummary(dir: dir, current: engine.id) { progress.line(line) }
         return (json, note)
     }
 
+    /// `<session>/.note`: the name of the session's note, so a re-run overwrites it.
+    private static let noteRecord = ".note"
+
     /// `2026-09-23 14-30 Transcript.md`. Re-running a session overwrites its own
     /// note; another session that started in the same minute gets a " 2" suffix.
-    private static func noteURL(in folder: URL, start: Date, session: String) -> URL {
+    private static func noteURL(in folder: URL, start: Date, session: URL) -> URL {
+        if let name = try? String(contentsOf: session.appendingPathComponent(noteRecord), encoding: .utf8),
+           !name.isEmpty, !name.contains("/") {
+            return folder.appendingPathComponent(name)
+        }
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH-mm"
         let base = "\(f.string(from: start)) Transcript"
-        let marker = "session: \(yamlString(session))\n"
+        // Notes written before `.note` carry the session in their frontmatter.
+        let marker = "session: \(yamlString(session.path))\n"
         for n in 1... {
             let url = folder.appendingPathComponent(n == 1 ? "\(base).md" : "\(base) \(n).md")
             guard let existing = try? String(contentsOf: url, encoding: .utf8) else { return url }
@@ -449,7 +456,10 @@ struct Transcript {
     struct SpeakerSpan { let id: String; let start: Double; let end: Double }
     struct Utterance { let speaker: String; let start: Double; let end: Double; let text: String }
 
+    /// What the note shows: a speaker's consecutive segments as one paragraph.
     private(set) var utterances: [Utterance] = []
+    /// Lines cut at every pause over `splitGap`, in time order.
+    private(set) var segments: [Utterance] = []
     private(set) var speakerNames: [String] = []
     /// Mic words dropped because they were the speakers leaking into the mic.
     private(set) var droppedEcho = 0
@@ -495,10 +505,9 @@ struct Transcript {
         droppedEcho = echo.filter { $0 }.count
         let micTurns = Self.turns(zip(mic, echo).compactMap { $1 ? nil : ($0, "Me") }, gap: splitGap)
 
-        utterances = Self.interleaved(micTurns + remoteTurns)
-            .sorted { $0.words[0].startTime < $1.words[0].startTime }
-            .map { Utterance(speaker: $0.speaker, start: $0.words[0].startTime, end: $0.words[$0.words.count - 1].endTime,
-                             text: $0.words.map(\.word).joined(separator: " ")) }
+        let segments = Self.interleaved(micTurns + remoteTurns).sorted { $0.words[0].startTime < $1.words[0].startTime }
+        self.segments = segments.map(Self.utterance)
+        utterances = Self.paragraphs(segments).map(Self.utterance)
         speakerNames = (micTurns.isEmpty ? [] : ["Me"])
             + (order.isEmpty ? (remoteTurns.isEmpty ? [] : ["Them"]) : order.compactMap { remote[$0] })
     }
@@ -539,9 +548,11 @@ struct Transcript {
         return result
     }
 
-    /// Cuts a turn wherever another speaker's turn starts inside it, so that
-    /// sorted by start time no line runs across someone else's. Cutting makes
-    /// new starts that may land inside other turns, so repeat until none do.
+    /// Cuts a turn wherever another speaker starts in a silence between two of
+    /// its words, so that sorted by start time no line runs across someone
+    /// else's. Talking over a word isn't a cut: "i" / "Okay." / "was just…"
+    /// reads worse than the overlap. Cutting makes new starts that may land
+    /// inside other turns, so repeat until none do.
     private static func interleaved(_ turns: [Turn]) -> [Turn] {
         var turns = turns
         while true {
@@ -551,7 +562,7 @@ struct Transcript {
                 let others = starts.filter { $0.0 != turn.speaker }.map(\.1)
                 var pieces = [Turn(speaker: turn.speaker, words: [turn.words[0]])]
                 for (prev, word) in zip(turn.words, turn.words.dropFirst()) {
-                    if others.contains(where: { prev.startTime < $0 && $0 <= word.startTime }) {
+                    if others.contains(where: { prev.endTime <= $0 && $0 < word.startTime }) {
                         pieces.append(Turn(speaker: turn.speaker, words: []))
                         cut = true
                     }
@@ -563,20 +574,43 @@ struct Transcript {
         }
     }
 
+    /// Joins a speaker's segments until someone else speaks, a pause of over
+    /// 5 s, or a sentence end once the paragraph passes a minute.
+    private static func paragraphs(_ segments: [Turn]) -> [Turn] {
+        var result: [Turn] = []
+        for segment in segments {
+            if var last = result.last, last.speaker == segment.speaker, let prev = last.words.last {
+                let sentenceEnded = prev.word.last.map { ".?!".contains($0) } ?? false
+                let long = prev.endTime - last.words[0].startTime > 60
+                if segment.words[0].startTime - prev.endTime <= 5 && !(sentenceEnded && long) {
+                    last.words += segment.words
+                    result[result.count - 1] = last
+                    continue
+                }
+            }
+            result.append(segment)
+        }
+        return result
+    }
+
+    private static func utterance(_ turn: Turn) -> Utterance {
+        Utterance(speaker: turn.speaker, start: turn.words[0].startTime, end: turn.words[turn.words.count - 1].endTime,
+                  text: turn.words.map(\.word).joined(separator: " "))
+    }
+
     private static func normalized(_ word: String) -> String {
         word.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 
-    func markdown(start: Date, duration: Double?, mic: String?, session: String, model: String) -> String {
+    func markdown(start: Date, duration: Double?, model: String) -> String {
         let iso = ISO8601DateFormatter()
         iso.timeZone = .current
         iso.formatOptions = [.withInternetDateTime]
         var lines = ["---", "date: \(iso.string(from: start))"]
         if let duration { lines.append("duration: \(yamlString(clock(duration)))") }
-        if let mic { lines.append("mic: \(yamlString(mic))") }
         lines.append("speakers:")
         lines += speakerNames.map { "  - \(yamlString($0))" }
-        lines += ["session: \(yamlString(session))", "model: \(model)", "tags:", "  - transcript", "---", ""]
+        lines += ["model: \(model)", "---", ""]
         if utterances.isEmpty {
             lines.append("_No speech detected._")
         } else {
