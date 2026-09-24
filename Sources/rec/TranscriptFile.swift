@@ -24,6 +24,10 @@ struct TranscriptFile: Codable {
     var channel: String
     var session: String
     var created: Date
+    /// `--split-gap` the lines were cut with.
+    var splitGap: Double?
+    /// Canonical terms from vocab.json, or absent with `--no-vocab`.
+    var vocabulary: [String]?
     var timing: Timing
     var words: Words
     var speakers: [Speaker]

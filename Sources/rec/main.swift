@@ -11,6 +11,8 @@ usage: rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach]
        rec transcribe [DIR]               transcribe a session (default: latest) into the Obsidian vault
          [--engine parakeet|whisper]      A/B another engine (Whisper runs on VAD speech regions only)
          [--channel mic|system|both]      one track; only parakeet + both writes the note
+         [--split-gap 0.6]                a pause this long (seconds) starts a new line
+         [--no-vocab]                     skip ~/.config/rec/vocab.json (boosting and alias fixes)
        rec config [--vault PATH] [--model v2|v3] [--show]
                                           choose the Obsidian vault (and Parakeet model) for transcripts
 
@@ -22,6 +24,8 @@ follows the system default input.
 Sessions go to ~/Recordings/rec/<timestamp>/ as mic.wav, system.wav (16 kHz mono) and session.json.
 When a recording stops it is transcribed (FluidAudio, on-device) into
 <vault>/transcriptions/<yyyy-MM-dd HH-mm> Transcript.md. `rec start` asks for the vault on first use.
+Names the models get wrong go in ~/.config/rec/vocab.json (created on first transcription):
+[{"text": "Oskar", "aliases": ["Oscar"]}]
 In the terminal running `rec start` the transcription runs right there with live progress
 (Ctrl-C again cancels it); with --detach it runs in the background.
 """
