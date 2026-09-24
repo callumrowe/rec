@@ -15,6 +15,7 @@ rec stop
 rec verify [SESSION_DIR]     # length / silence / sync check (default: latest session)
 rec open                     # open ~/Recordings/rec in Finder
 rec transcribe [SESSION_DIR] # (re)transcribe a session into the vault (default: latest session)
+             [--engine parakeet|whisper] [--channel mic|system|both]
 rec config                   # choose the Obsidian vault; --vault PATH, --model v2|v3, --show
 ```
 
@@ -26,6 +27,7 @@ Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
 | `system.wav`  | everything the Mac plays, 16 kHz mono 16-bit |
 | `session.json`| start timestamp (ISO 8601 + epoch ms), end, duration, frame count, device UIDs, event log (gaps, device loss, silence warnings) |
 | `transcribe.log` | transcription progress and FluidAudio / Core ML diagnostics |
+| `transcript.<engine>.json` | words (per track), speakers, turns and timings from the last run of that engine |
 
 ## Transcription
 
@@ -61,6 +63,15 @@ and one line per turn:
 - **Echo:** without headphones the mic also hears the call. Mic words that the
   system track said at the same moment (±0.8 s) are dropped, so remote speech
   isn't duplicated as "Me".
+- **A/B engines:** `--engine whisper` swaps Parakeet for WhisperKit
+  large-v3-turbo (downloads ~1.6 GB once to `~/Documents/huggingface/`; the first
+  load compiles it for the Neural Engine, which takes several minutes). Whisper
+  invents text over silence, so FluidAudio's Silero VAD cuts each track into
+  speech regions first and only those go to Whisper; word times are mapped back
+  to the session timeline. `--channel mic|system` transcribes one track.
+  Every run writes `<session>/transcript.<engine>.json` (same schema for both
+  engines, so they sit side by side) and prints each engine's wall-clock time.
+  Only the default run (Parakeet, both tracks) writes the vault note.
 - Re-running `rec transcribe` on a session overwrites that session's note.
   It runs from the CLI, not Rec.app, so writing into a vault under `~/Documents`
   uses your terminal's file access.

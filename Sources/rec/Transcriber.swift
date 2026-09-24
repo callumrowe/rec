@@ -1,22 +1,58 @@
 import FluidAudio
 import Foundation
 
-/// `rec transcribe [DIR]`: Parakeet ASR on both tracks, speaker diarization on
-/// system.wav, merged on the shared timeline into `<vault>/transcriptions/`.
+/// `rec transcribe [DIR] [--engine parakeet|whisper] [--channel mic|system|both]`:
+/// ASR on the tracks, speaker diarization on system.wav, merged on the shared
+/// timeline into `<DIR>/transcript.<engine>.json` and, for the default run
+/// (Parakeet, both tracks), a note in `<vault>/transcriptions/`.
 /// mic.wav is "Me"; remote voices are "Them", or "Speaker N" when the diarizer
 /// hears more than one.
 enum Transcriber {
+    enum Channel: String, CaseIterable { case mic, system, both }
+
+    struct Options {
+        var engine = Engine.parakeet
+        var channel = Channel.both
+        /// The note is the regular product; other engines and single tracks are experiments.
+        var writesNote: Bool { engine == .parakeet && channel == .both }
+    }
+
     static func run(_ args: [String], background: Bool = false) -> Never {
+        var options = Options()
+        var path: String?
+        var rest = args[...]
+        func value(_ flag: String) -> String {
+            guard let v = rest.popFirst() else { fail("\(flag) needs a value", code: 64) }
+            return v
+        }
+        while let arg = rest.popFirst() {
+            switch arg {
+            case "--engine":
+                let v = value(arg)
+                guard let e = Engine(rawValue: v) else { fail("--engine must be parakeet or whisper, not \(v)", code: 64) }
+                options.engine = e
+            case "--channel":
+                let v = value(arg)
+                guard let c = Channel(rawValue: v) else { fail("--channel must be mic, system or both, not \(v)", code: 64) }
+                options.channel = c
+            case _ where arg.hasPrefix("-"): fail("unknown option \(arg)\n\(usage)", code: 64)
+            case _ where path == nil: path = arg
+            default: fail("unexpected argument \(arg)\n\(usage)", code: 64)
+            }
+        }
         let dir: URL
-        if let path = args.first {
+        if let path {
             dir = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         } else if let latest = latestSession() {
             dir = latest
         } else {
             fail("no sessions in \(Paths.recordingsRoot.path)")
         }
-        guard let config = Config.load() else { fail("no Obsidian vault configured; run `rec config`") }
-        if let problem = Vault.check(config.vault) { fail("\(problem); run `rec config`") }
+        let config = Config.load()
+        if options.writesNote {
+            guard let config else { fail("no Obsidian vault configured; run `rec config`") }
+            if let problem = Vault.check(config.vault) { fail("\(problem); run `rec config`") }
+        }
 
         // One transcription per session at a time (`rec stop` and a foreground `rec start` may both launch one).
         let lockFD = open(dir.appendingPathComponent(".transcribe.lock").path, O_CREAT | O_RDWR, 0o644)
@@ -70,9 +106,10 @@ enum Transcriber {
 
         Task {
             do {
-                let note = try await transcribe(dir: dir, config: config)
-                progress.line("\(Style.ok) transcript → \(Style.path(note.path))")
-                if background { notify("Transcript saved", note.deletingPathExtension().lastPathComponent) }
+                let (json, note) = try await transcribe(dir: dir, options: options, config: config)
+                progress.line("\(Style.ok) transcript → \(Style.path((note ?? json).path))")
+                if note != nil { progress.line(Style.dim("  words and turns → \(json.path)")) }
+                if background { notify("Transcript saved", (note ?? json).deletingPathExtension().lastPathComponent) }
                 done(0)
             } catch {
                 progress.cancel("\(Style.bad) transcription failed: \(error.localizedDescription) (details in \(Style.path(log)))")
@@ -139,37 +176,40 @@ enum Transcriber {
 
     // MARK: - Pipeline
 
-    private static func transcribe(dir: URL, config: Config) async throws -> URL {
+    private static func transcribe(dir: URL, options: Options, config: Config?) async throws -> (json: URL, note: URL?) {
         let micURL = dir.appendingPathComponent("mic.wav")
         let systemURL = dir.appendingPathComponent("system.wav")
-        for url in [micURL, systemURL] where !FileManager.default.fileExists(atPath: url.path) {
+        let tracks = [(Channel.mic, micURL), (.system, systemURL)].filter { options.channel == .both || options.channel == $0.0 }
+        for (_, url) in tracks where !FileManager.default.fileExists(atPath: url.path) {
             throw TranscribeError("missing \(url.path)")
         }
         let session = (try? Data(contentsOf: dir.appendingPathComponent("session.json")))
             .flatMap { try? JSONDecoder().decode(SessionInfo.self, from: $0) }
         let started = Date()
         let audio = session?.durationSeconds.map { "  " + Style.dim("\(shortDuration($0)) of audio") } ?? ""
-        progress.line("\(Style.strong("◆", Style.accent)) \(Style.bold("transcribing"))  \(Style.path(dir.path))\(audio)")
+        let which = options.writesNote ? "" : "  " + Style.dim("\(options.engine.rawValue), \(options.channel.rawValue)")
+        progress.line("\(Style.strong("◆", Style.accent)) \(Style.bold("transcribing"))  \(Style.path(dir.path))\(audio)\(which)")
 
-        let version: AsrModelVersion = config.model == "v3" ? .v3 : .v2
-        let model = "Parakeet \(config.model ?? "v2")"
-        progress.begin("loading \(model) \(Style.dim("(the first run downloads the models)"))")
-        let asr = AsrManager(config: .default)
-        try await asr.loadModels(try await AsrModels.downloadAndLoad(version: version))
-        progress.end(Style.event("✓ model: \(model) loaded"))
+        let engine = options.engine.make(config: config)
+        progress.begin("loading \(engine.label) \(Style.dim("(the first run downloads the models)"))")
+        try await engine.load()
+        let loaded = Date()
+        progress.end(Style.event("✓ model: \(engine.label) loaded"))
 
-        func words(_ url: URL) async throws -> [WordTiming] {
-            var state = TdtDecoderState.make(decoderLayers: version.decoderLayers)
-            let result = try await asr.transcribe(url, decoderState: &state)
-            return buildWordTimings(from: result.tokenTimings ?? [])
+        var words: [Channel: [Word]] = [:]
+        for (channel, url) in tracks {
+            let label = channel == .mic ? "transcribing mic" : "transcribing system audio"
+            progress.begin(label)
+            words[channel] = try await engine.words(in: url) { progress.update("\(label)  \(Style.dim($0))") }
+            progress.end(Style.event("✓ \(channel.rawValue): \(words[channel]!.count) words"))
         }
-        progress.begin("transcribing mic")
-        let micWords = try await words(micURL)
-        progress.end(Style.event("✓ mic: \(micWords.count) words"))
-        progress.begin("transcribing system audio")
-        let systemWords = try await words(systemURL)
-        progress.end(Style.event("✓ system: \(systemWords.count) words"))
-        await asr.cleanup()
+        await engine.unload()
+        let timing = TranscriptFile.Timing(
+            modelLoadSeconds: loaded.timeIntervalSince(started),
+            transcribeSeconds: Date().timeIntervalSince(loaded),
+            wallClockSeconds: Date().timeIntervalSince(started))
+        let micWords = words[.mic] ?? []
+        let systemWords = words[.system] ?? []
 
         var speakers: [Transcript.SpeakerSpan] = []
         if !systemWords.isEmpty {
@@ -189,23 +229,35 @@ enum Transcriber {
         }
 
         let transcript = Transcript(mic: micWords, system: systemWords, speakers: speakers)
-        let startDate = session.map { Date(timeIntervalSince1970: Double($0.startEpochMs) / 1000) }
-            ?? (try? FileManager.default.attributesOfItem(atPath: micURL.path)[.creationDate] as? Date)
-            ?? Date()
-        let micName = session.map { s in
-            s.micName ?? AudioDevices.device(uid: s.micDeviceUID).flatMap(AudioDevices.name) ?? s.micDeviceUID
-        }
-        let note = transcript.markdown(
-            start: startDate, duration: session?.durationSeconds, mic: micName,
-            session: dir.path, model: version == .v3 ? "parakeet-tdt-0.6b-v3" : "parakeet-tdt-0.6b-v2")
+        let json = dir.appendingPathComponent("transcript.\(engine.id).json")
+        try TranscriptFile(
+            engine: engine.id, model: engine.model, channel: options.channel.rawValue, session: dir.path,
+            created: Date(), timing: timing,
+            words: .init(mic: words[.mic].map(TranscriptFile.words), system: words[.system].map(TranscriptFile.words)),
+            speakers: speakers.map { .init(id: $0.id, start: $0.start, end: $0.end) },
+            utterances: transcript.utterances.map { .init(speaker: $0.speaker, start: $0.start, end: $0.end, text: $0.text) }
+        ).write(to: json)
 
-        try Vault.ensureTranscriptionsDir(config)
-        let url = noteURL(in: config.transcriptionsDir, start: startDate, session: dir.path)
-        try note.write(to: url, atomically: true, encoding: .utf8)
+        var note: URL?
+        if options.writesNote, let config {
+            let startDate = session.map { Date(timeIntervalSince1970: Double($0.startEpochMs) / 1000) }
+                ?? (try? FileManager.default.attributesOfItem(atPath: micURL.path)[.creationDate] as? Date)
+                ?? Date()
+            let micName = session.map { s in
+                s.micName ?? AudioDevices.device(uid: s.micDeviceUID).flatMap(AudioDevices.name) ?? s.micDeviceUID
+            }
+            let markdown = transcript.markdown(
+                start: startDate, duration: session?.durationSeconds, mic: micName, session: dir.path, model: engine.model)
+            try Vault.ensureTranscriptionsDir(config)
+            let url = noteURL(in: config.transcriptionsDir, start: startDate, session: dir.path)
+            try markdown.write(to: url, atomically: true, encoding: .utf8)
+            note = url
+        }
         progress.line(Style.dim(String(format: "  %d turns, %d echo words dropped from the mic, %@ in all",
                                        transcript.utterances.count, transcript.droppedEcho,
                                        shortDuration(Date().timeIntervalSince(started)))))
-        return url
+        for line in TranscriptFile.timingSummary(dir: dir, current: engine.id) { progress.line(line) }
+        return (json, note)
     }
 
     /// `2026-09-23 14-30 Transcript.md`. Re-running a session overwrites its own
@@ -293,6 +345,15 @@ final class TranscribeProgress: @unchecked Sendable {
         }
     }
 
+    /// Relabels the running step (the terminal redraws it on the next tick).
+    func update(_ label: String) {
+        lock.withLock {
+            guard let current = step, current.label != label else { return }
+            log(label)
+            step = (label, current.start)
+        }
+    }
+
     /// Ends the running step with a summary and how long it took.
     func end(_ summary: String) {
         let took = lock.withLock { () -> TimeInterval in
@@ -366,14 +427,14 @@ func shortDuration(_ seconds: TimeInterval) -> String {
 /// Word timings from both tracks, merged into speaker turns on the session timeline.
 struct Transcript {
     struct SpeakerSpan { let id: String; let start: Double; let end: Double }
-    struct Utterance { let speaker: String; let start: Double; let text: String }
+    struct Utterance { let speaker: String; let start: Double; let end: Double; let text: String }
 
     private(set) var utterances: [Utterance] = []
     private(set) var speakerNames: [String] = []
     /// Mic words dropped because they were the speakers leaking into the mic.
     private(set) var droppedEcho = 0
 
-    init(mic: [WordTiming], system: [WordTiming], speakers: [SpeakerSpan]) {
+    init(mic: [Word], system: [Word], speakers: [SpeakerSpan]) {
         // Remote speech: cut into sentences (or pause-separated fragments), then
         // give each the diarized speaker most of its words fall in, so a label
         // can't flip mid-sentence. Speakers are numbered in order of first speech.
@@ -416,7 +477,7 @@ struct Transcript {
 
         utterances = (micTurns + remoteTurns)
             .sorted { $0.words[0].startTime < $1.words[0].startTime }
-            .map { Utterance(speaker: $0.speaker, start: $0.words[0].startTime,
+            .map { Utterance(speaker: $0.speaker, start: $0.words[0].startTime, end: $0.words[$0.words.count - 1].endTime,
                              text: $0.words.map(\.word).joined(separator: " ")) }
         speakerNames = (micTurns.isEmpty ? [] : ["Me"])
             + (order.isEmpty ? (remoteTurns.isEmpty ? [] : ["Them"]) : order.compactMap { remote[$0] })
@@ -424,7 +485,7 @@ struct Transcript {
 
     /// The diarized speaker most of these words fall in (by word midpoint), or
     /// the nearest one within a second when none do.
-    private static func dominantSpeaker(_ words: [WordTiming], _ speakers: [SpeakerSpan]) -> String? {
+    private static func dominantSpeaker(_ words: [Word], _ speakers: [SpeakerSpan]) -> String? {
         var votes: [String: Int] = [:]
         for word in words {
             let mid = (word.startTime + word.endTime) / 2
@@ -436,11 +497,11 @@ struct Transcript {
         return speakers.min { distance(mid, $0) < distance(mid, $1) }.flatMap { distance(mid, $0) <= 1 ? $0.id : nil }
     }
 
-    private struct Turn { let speaker: String; var words: [WordTiming] }
+    private struct Turn { let speaker: String; var words: [Word] }
 
     /// Splits one track into turns: on speaker change, a long pause, or a
     /// shorter pause after a sentence ends. Long monologues break at sentences.
-    private static func turns(_ words: [(WordTiming, String)], pause: Double = 2, sentencePause: Double = 0.8) -> [Turn] {
+    private static func turns(_ words: [(Word, String)], pause: Double = 2, sentencePause: Double = 0.8) -> [Turn] {
         var result: [Turn] = []
         for (word, speaker) in words {
             if var last = result.last, last.speaker == speaker, let prev = last.words.last {
