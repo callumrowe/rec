@@ -9,6 +9,8 @@ usage: rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach]
        rec verify [DIR]                   check a session (default: latest) for length, silence, sync
        rec open                           open the recordings folder in Finder
        rec transcribe [DIR]               transcribe a session (default: latest) into the Obsidian vault
+         [--engine parakeet|whisper]      A/B another engine (Whisper runs on VAD speech regions only)
+         [--channel mic|system|both]      one track; only parakeet + both writes the note
        rec config [--vault PATH] [--model v2|v3] [--show]
                                           choose the Obsidian vault (and Parakeet model) for transcripts
 
