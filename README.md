@@ -10,6 +10,7 @@ make install                 # builds build/Rec.app, copies to ~/Applications, l
 rec start                    # asks which mic, then records with live levels; Ctrl-C or `rec stop` to finish
 rec start --detach           # background; output goes to <session>/rec.log
 rec start --mic streamcam    # skip the question (name substring or UID); --yes takes the default
+rec start --dictate          # mic only, for thinking aloud; becomes a Dictation note
 rec devices                  # list inputs, their UIDs, and which one rec would default to
 rec stop
 rec verify [SESSION_DIR]     # length / silence / sync check (default: latest session)
@@ -24,8 +25,8 @@ Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
 | file          | contents |
 |---------------|----------|
 | `mic.wav`     | built-in mic, 16 kHz mono 16-bit |
-| `system.wav`  | everything the Mac plays, 16 kHz mono 16-bit |
-| `session.json`| start timestamp (ISO 8601 + epoch ms), end, duration, frame count, device UIDs, event log (gaps, device loss, silence warnings) |
+| `system.wav`  | everything the Mac plays, 16 kHz mono 16-bit (not in a dictation) |
+| `session.json`| `mode: "dictation"` for `--dictate`, start timestamp (ISO 8601 + epoch ms), end, duration, frame count, device UIDs, event log (gaps, device loss, silence warnings) |
 | `transcribe.log` | transcription progress and FluidAudio / Core ML diagnostics |
 | `transcript.<engine>.json` | words (per track), speakers, turns and timings from the last run of that engine |
 
@@ -72,6 +73,28 @@ and one line per turn:
   Every run writes `<session>/transcript.<engine>.json` (same schema for both
   engines, so they sit side by side) and prints each engine's wall-clock time.
   Only the default run (Parakeet, both tracks) writes the vault note.
+- **Dictation:** `rec start --dictate` records only the mic: no system tap, no
+  test chime, one level meter. It's transcribed the same way (Parakeet on
+  mic.wav, no diarization or echo removal) into
+  `<vault>/transcriptions/2026-10-02 09-15 Dictation.md`, whose frontmatter has
+  `type: dictation` and `tags: [dictation]` instead of `speakers`, and whose
+  paragraphs carry a timestamp but no speaker name:
+
+  ```
+  ---
+  date: 2026-10-02T09:15:00-04:00
+  duration: "00:04:12"
+  type: dictation
+  tags:
+    - dictation
+  model: parakeet-tdt-0.6b-v2
+  ---
+
+  **[00:00:01]** So the thing I keep coming back to is…
+  ```
+
+  `rec transcribe` and `rec verify` read the mode from `session.json`, so they
+  need no flag.
 - Re-running `rec transcribe` on a session overwrites that session's note.
   It runs from the CLI, not Rec.app, so writing into a vault under `~/Documents`
   uses your terminal's file access.
