@@ -5,7 +5,8 @@ import Foundation
 /// cross-correlating 10 ms energy envelopes of system.wav against mic.wav: when
 /// the call plays through the speakers the mic hears it a few ms later, and that
 /// lag should stay constant for the whole recording. With headphones the mic
-/// can't hear the call and sync can't be measured this way.
+/// can't hear the call and sync can't be measured this way. A dictation has
+/// only mic.wav, so only its silence is checked.
 enum Verify {
     static func run(_ args: [String]) -> Never {
         let dir: URL
@@ -18,10 +19,12 @@ enum Verify {
         }
         print("\(Style.dim("session"))  \(Style.path(dir.path))")
         print("")
-        let mic: WAVData, system: WAVData
+        let dictation = (try? Data(contentsOf: dir.appendingPathComponent("session.json")))
+            .flatMap { try? JSONDecoder().decode(SessionInfo.self, from: $0) }?.isDictation == true
+        let mic: WAVData, system: WAVData?
         do {
             mic = try WAVData(url: dir.appendingPathComponent("mic.wav"))
-            system = try WAVData(url: dir.appendingPathComponent("system.wav"))
+            system = dictation ? nil : try WAVData(url: dir.appendingPathComponent("system.wav"))
         } catch {
             fail("cannot read WAVs: \(error.localizedDescription)")
         }
@@ -31,9 +34,26 @@ enum Verify {
             print("\(mark) \(Style.bold(label.padding(toLength: 7, withPad: " ", startingAt: 0))) \(detail)")
         }
         let sep = Style.faint(" · ")
+        func trackRow(_ name: String, _ track: WAVData) -> Bool {
+            let s = stats(track.samples, rate: Double(track.sampleRate))
+            let good = s.silentFraction < 0.9
+            let silent = String(format: "%.0f%% silent", s.silentFraction * 100)
+            row(good, name, String(format: "rms %.1f dBFS", s.rmsDB) + sep + String(format: "peak %.1f dBFS", s.peakDB)
+                + sep + (good ? Style.dim(silent) : Style.fg(silent, Style.red)))
+            return good
+        }
+        func verdict(_ ok: Bool) -> Never {
+            print("")
+            print(ok ? Style.paint(" PASS ", "1", "7", Style.green.fg) : Style.paint(" FAIL ", "1", "7", Style.red.fg))
+            exit(ok ? 0 : 1)
+        }
 
         var ok = true
         let rate = Double(mic.sampleRate)
+        guard let system else {
+            row(true, "length", "\(clock(Double(mic.samples.count) / rate))\(sep)\(Style.dim("dictation, mic only"))")
+            verdict(trackRow("mic", mic) && mic.sampleRate == 16_000)
+        }
         let sameLength = mic.samples.count == system.samples.count
         if sameLength {
             row(true, "length", "\(clock(Double(mic.samples.count) / rate))\(sep)\(Style.dim("\(mic.samples.count) frames on both tracks"))")
@@ -45,12 +65,7 @@ enum Verify {
         ok = ok && sameLength && mic.sampleRate == 16_000 && system.sampleRate == 16_000
 
         for (name, track) in [("mic", mic), ("system", system)] {
-            let s = stats(track.samples, rate: rate)
-            let good = s.silentFraction < 0.9
-            let silent = String(format: "%.0f%% silent", s.silentFraction * 100)
-            row(good, name, String(format: "rms %.1f dBFS", s.rmsDB) + sep + String(format: "peak %.1f dBFS", s.peakDB)
-                + sep + (good ? Style.dim(silent) : Style.fg(silent, Style.red)))
-            ok = ok && good
+            ok = trackRow(name, track) && ok
         }
 
         let lags = syncLags(system: system.samples, mic: mic.samples, rate: rate)
@@ -69,9 +84,7 @@ enum Verify {
             let text = String(format: "%@  mic lags by %+4.0f ms  r=%.2f", clock(l.at), l.lagMs, l.correlation)
             print("          " + (weak ? Style.faint(text + "  weak, ignored") : Style.dim(text)))
         }
-        print("")
-        print(ok ? Style.paint(" PASS ", "1", "7", Style.green.fg) : Style.paint(" FAIL ", "1", "7", Style.red.fg))
-        exit(ok ? 0 : 1)
+        verdict(ok)
     }
 
     private static func stats(_ x: [Float], rate: Double) -> (rmsDB: Double, peakDB: Double, silentFraction: Double) {

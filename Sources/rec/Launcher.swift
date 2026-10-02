@@ -47,10 +47,11 @@ func fail(_ message: String, code: Int32 = 1) -> Never {
 }
 
 enum Launcher {
-    /// `rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach]`
+    /// `rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach] [--dictate]`
     static func start(_ args: [String]) -> Never {
         var outDir: String?
         var detach = false
+        var dictate = false
         var skipPicker = false
         var micQuery: String?
         var it = args.makeIterator()
@@ -64,6 +65,7 @@ enum Launcher {
                 micQuery = value
             case "-y", "--yes": skipPicker = true
             case "-d", "--detach": detach = true
+            case "--dictate": dictate = true
             default: fail("unknown option \(arg)", code: 64)
             }
         }
@@ -79,7 +81,7 @@ enum Launcher {
             guard let input = resolved.input else { fail(resolved.error ?? "unknown mic") }
             micUID = input.uid
         } else {
-            micUID = chooseMic(interactive: interactive).uid
+            micUID = chooseMic(interactive: interactive, dictate: dictate).uid
         }
         checkTranscription(interactive: interactive)
 
@@ -100,7 +102,7 @@ enum Launcher {
         guard let app = appBundle() else {
             // Development build outside Rec.app: TCC will attribute capture to the terminal.
             fputs("\(Style.warn) not running from Rec.app; recording in-process (permissions belong to your terminal)\n", stderr)
-            Recorder(dir: dir, micUID: micUID).run()
+            Recorder(dir: dir, micUID: micUID, dictation: dictate).run()
         }
 
         // Launch through LaunchServices so Rec.app is its own "responsible process"
@@ -118,6 +120,7 @@ enum Launcher {
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         open.arguments = ["-n", "-g"] + forwarded
             + ["--stdout", output, "--stderr", output, app.path, "--args", "_record", dir.path, micUID]
+            + (dictate ? ["--dictate"] : [])
         do {
             try open.run()
             open.waitUntilExit()
@@ -266,7 +269,7 @@ enum Launcher {
         return inputs.indices.min { (rank(inputs[$0]), $0) < (rank(inputs[$1]), $1) }
     }
 
-    private static func chooseMic(interactive: Bool) -> AudioDevices.Input {
+    private static func chooseMic(interactive: Bool, dictate: Bool) -> AudioDevices.Input {
         let inputs = AudioDevices.inputs()
         guard let defaultIndex = defaultMic(inputs) else { fail("no input devices connected") }
         let builtIn = AudioDevices.builtInInputUID()
@@ -279,13 +282,13 @@ enum Launcher {
             if mutedBuiltIn(input) { fputs("\(Style.warn) the lid is closed, so the built-in mic will record silence\n", stderr) }
             return input
         }
-        return pickMic(inputs, defaultIndex: defaultIndex, muted: mutedBuiltIn, term: term)
+        return pickMic(inputs, defaultIndex: defaultIndex, muted: mutedBuiltIn, dictate: dictate, term: term)
     }
 
     /// Arrow-key list: ↑/↓ (or j/k, Tab) to move, 1–9 to jump, Enter to choose,
     /// Esc/q/Ctrl-C to cancel. Collapses to a one-line summary once chosen.
     private static func pickMic(_ inputs: [AudioDevices.Input], defaultIndex: Int,
-                                muted: (AudioDevices.Input) -> Bool, term: RawTerminal) -> AudioDevices.Input {
+                                muted: (AudioDevices.Input) -> Bool, dictate: Bool, term: RawTerminal) -> AudioDevices.Input {
         var cursor = defaultIndex
         var confirming = false
         var drawnLines = 0
@@ -295,7 +298,7 @@ enum Launcher {
             (drawnLines > 1 ? "\u{1B}[\(drawnLines - 1)A" : "") + "\r\u{1B}[J"
         }
         func draw() {
-            var lines = [Style.bold("Which mic?") + "  " + Style.dim("rec records this plus all system audio")]
+            var lines = [Style.bold("Which mic?") + "  " + Style.dim(dictate ? "rec records only this, for dictation" : "rec records this plus all system audio")]
             for (i, input) in inputs.enumerated() {
                 let selected = i == cursor
                 let pointer = selected ? Style.strong("❯", Style.accent) : " "

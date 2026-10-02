@@ -10,6 +10,8 @@ struct SessionInfo: Codable {
     }
 
     var version = 1
+    /// "dictation" for `rec start --dictate` (mic only); absent for a meeting (mic + system audio).
+    var mode: String?
     var start: String
     var startEpochMs: Int64
     var sampleRate = Int(TrackWriter.sampleRate)
@@ -22,6 +24,8 @@ struct SessionInfo: Codable {
     var frames: Int64?
     var capturedFrames: [String: Int64]?
     var events: [Event] = []
+
+    var isDictation: Bool { mode == "dictation" }
 }
 
 let iso8601: ISO8601DateFormatter = {
@@ -30,10 +34,12 @@ let iso8601: ISO8601DateFormatter = {
     return f
 }()
 
-/// The long-running recording process (`rec _record <dir>`), launched inside Rec.app.
+/// The long-running recording process (`rec _record <dir> [<mic uid>] [--dictate]`), launched inside Rec.app.
+/// Dictation records the mic alone: no system tap, no test chime.
 final class Recorder {
     private let dir: URL
     private let requestedMicUID: String?
+    private let dictation: Bool
     private var micIsBuiltIn = true
     private let interactive = isatty(STDOUT_FILENO) != 0
     private var t0: UInt64 = 0
@@ -42,9 +48,9 @@ final class Recorder {
     private var meterLineVisible = false
 
     private var micWriter: TrackWriter!
-    private var systemWriter: TrackWriter!
+    private var systemWriter: TrackWriter?
     private var mic: MicCapture!
-    private var system: SystemTap!
+    private var system: SystemTap?
     private var lastSystemRestart = Date.distantPast
 
     private var silentSince: [String: Date] = [:]
@@ -66,9 +72,10 @@ final class Recorder {
     static let silenceThreshold = 1e-4  // -80 dBFS; real mics idle around -60..-70
     static let silenceWarnAfter: TimeInterval = 10
 
-    init(dir: URL, micUID: String? = nil) {
+    init(dir: URL, micUID: String? = nil, dictation: Bool = false) {
         self.dir = dir
         self.requestedMicUID = micUID
+        self.dictation = dictation
     }
 
     func run() -> Never {
@@ -89,9 +96,15 @@ final class Recorder {
         session = SessionInfo(start: iso8601.string(from: startDate),
                               startEpochMs: Int64((startDate.timeIntervalSince1970 * 1000).rounded()),
                               micDeviceUID: micUID)
+        if dictation {
+            session.mode = "dictation"
+            session.files = ["mic": "mic.wav"]
+        }
         do {
             micWriter = try TrackWriter(name: "mic", url: dir.appendingPathComponent("mic.wav"), t0: t0, log: log)
-            systemWriter = try TrackWriter(name: "system", url: dir.appendingPathComponent("system.wav"), t0: t0, log: log)
+            if !dictation {
+                systemWriter = try TrackWriter(name: "system", url: dir.appendingPathComponent("system.wav"), t0: t0, log: log)
+            }
         } catch {
             say(Style.event("✗ cannot create output files: \(error.localizedDescription)"))
             PIDFile.remove()
@@ -101,15 +114,17 @@ final class Recorder {
         micName = AudioDevices.device(uid: micUID).flatMap(AudioDevices.name) ?? micUID
         eventsLock.withLock { session.micName = micName }
         say("")
-        say("\(Style.strong("●", Style.accent)) \(Style.strong("REC", Style.accent))  \(Style.dim("mic + system audio"))")
+        say("\(Style.strong("●", Style.accent)) \(Style.strong("REC", Style.accent))  \(Style.dim(dictation ? "dictation, mic only" : "mic + system audio"))")
         say("  \(Style.dim("mic    "))  \(micName)  \(Style.faint(micUID))")
         say("  \(Style.dim("session"))  \(Style.path(dir.path))")
         say("  \(Style.dim("stop   "))  " + (interactive ? "ctrl-c" + Style.dim(" or ") : "") + "rec stop")
         say("")
         if interactive, Style.enabled { writeOut("\u{1B}[?25l") }
 
-        system = SystemTap(writer: systemWriter)
-        startSystem()
+        if let systemWriter {
+            system = SystemTap(writer: systemWriter)
+            startSystem()
+        }
         mic = MicCapture(uid: micUID, writer: micWriter, log: log)
         mic.start()
         saveSession()
@@ -128,6 +143,7 @@ final class Recorder {
     }
 
     private func startSystem() {
+        guard let system else { return }
         lastSystemRestart = Date()
         do {
             try system.start()
@@ -157,13 +173,13 @@ final class Recorder {
         guard !stopping else { return }
         ticks += 1
         let micMeter = micWriter.takeMeter()
-        let systemMeter = systemWriter.takeMeter()
+        let systemMeter = systemWriter?.takeMeter()
 
         if ticks % 2 == 0 {
             mic.poll()
             // An aggregate device runs continuously (zeros when nothing plays), so
             // no buffers at all means the tap broke, not that the call went quiet.
-            if (!system.isRunning || systemMeter.secondsSinceLastBuffer > 3),
+            if let system, let systemMeter, (!system.isRunning || systemMeter.secondsSinceLastBuffer > 3),
                Date().timeIntervalSince(lastSystemRestart) > 5 {
                 if system.isRunning { log("system: no audio buffers for 3s, rebuilding tap") }
                 system.stop()
@@ -172,7 +188,7 @@ final class Recorder {
         }
         if ticks % 4 == 0 {
             micWriter.flushHeader()
-            systemWriter.flushHeader()
+            systemWriter?.flushHeader()
             saveSession()
         }
 
@@ -185,16 +201,19 @@ final class Recorder {
         let micHint = lidClosed ? "the MacBook lid is closed, which mutes the built-in mic"
             : "check Rec has Microphone permission (System Settings › Privacy & Security › Microphone) and the mic isn't muted"
         let elapsed = hostSeconds(from: t0, to: mach_absolute_time())
-        startupCheck(micMeter, systemMeter, elapsed: elapsed, micHint: micHint)
+        checkMic(micMeter, elapsed: elapsed, hint: micHint)
         checkSilence("mic", micMeter, hint: micHint)
-        checkSilence("system", systemMeter,
-                     hint: systemConfirmed ? "nothing is playing (capture was confirmed earlier, so the call may just be quiet)"
-                         : "if audio is playing, Rec is missing System Audio Recording permission (System Settings › Privacy & Security › Screen & System Audio Recording)")
+        if let systemMeter {
+            checkSystem(systemMeter)
+            checkSilence("system", systemMeter,
+                         hint: systemConfirmed ? "nothing is playing (capture was confirmed earlier, so the call may just be quiet)"
+                             : "if audio is playing, Rec is missing System Audio Recording permission (System Settings › Privacy & Security › Screen & System Audio Recording)")
+        }
 
-        let barWidth = ((terminalColumns() - 46) / 2).clamped(6, 24)
+        let barWidth = systemMeter == nil ? (terminalColumns() - 32).clamped(6, 48) : ((terminalColumns() - 46) / 2).clamped(6, 24)
         let dot = ticks % 2 == 0 ? Style.strong("●", Style.accent) : Style.faint("●")
-        let line = "\(dot) \(Style.bold(clock(elapsed)))   \(Style.dim("mic")) \(meterText(micMeter, "mic", barWidth))"
-            + "   \(Style.dim("sys")) \(meterText(systemMeter, "system", barWidth))"
+        var line = "\(dot) \(Style.bold(clock(elapsed)))   \(Style.dim("mic")) \(meterText(micMeter, "mic", barWidth))"
+        if let systemMeter { line += "   \(Style.dim("sys")) \(meterText(systemMeter, "system", barWidth))" }
         if interactive {
             eventsLock.withLock {
                 writeOut("\r\u{1B}[2K\(line)")
@@ -205,26 +224,26 @@ final class Recorder {
         }
     }
 
-    /// Mic: after 4s, is the device delivering anything above digital silence?
-    /// (A live mic's noise floor is well above the threshold, so no need to speak.)
-    /// System: a tap without permission returns silence, indistinguishable from
-    /// nothing playing, so play a short chime and check the tap captures it.
-    private func startupCheck(_ mic: TrackWriter.Meter, _ systemMeter: TrackWriter.Meter,
-                              elapsed: Double, micHint: String) {
-        if !micChecked {
-            micPeakRMS = max(micPeakRMS, mic.rms ?? 0)
-            if elapsed >= 4 {
-                micChecked = true
-                if micPeakRMS >= Self.silenceThreshold {
-                    log(String(format: "✓ mic: %@ is live (%.0f dB)", micName, 20 * log10(micPeakRMS)))
-                } else if mic.secondsSinceLastBuffer.isInfinite {
-                    log("✗ mic: no audio arriving from \(micName): \(micHint)")
-                } else {
-                    log("✗ mic: \(micName) is sending pure silence: \(micHint)")
-                }
-            }
+    /// Startup check for the mic: after 4s, is the device delivering anything above
+    /// digital silence? (A live mic's noise floor is well above the threshold, so no need to speak.)
+    private func checkMic(_ mic: TrackWriter.Meter, elapsed: Double, hint: String) {
+        guard !micChecked else { return }
+        micPeakRMS = max(micPeakRMS, mic.rms ?? 0)
+        guard elapsed >= 4 else { return }
+        micChecked = true
+        if micPeakRMS >= Self.silenceThreshold {
+            log(String(format: "✓ mic: %@ is live (%.0f dB)", micName, 20 * log10(micPeakRMS)))
+        } else if mic.secondsSinceLastBuffer.isInfinite {
+            log("✗ mic: no audio arriving from \(micName): \(hint)")
+        } else {
+            log("✗ mic: \(micName) is sending pure silence: \(hint)")
         }
+    }
 
+    /// Startup check for system audio: a tap without permission returns silence,
+    /// indistinguishable from nothing playing, so play a short chime and check the tap captures it.
+    private func checkSystem(_ systemMeter: TrackWriter.Meter) {
+        guard let system else { return }
         if !systemConfirmed, (systemMeter.rms ?? 0) >= Self.silenceThreshold {
             systemConfirmed = true
             log(chimePlayedAt == nil ? "✓ system audio: capturing" : "✓ system audio: capture confirmed (heard test chime)")
@@ -284,21 +303,23 @@ final class Recorder {
         let frames = Int64((duration * TrackWriter.sampleRate).rounded())
 
         mic.stop()
-        system.stop()
+        system?.stop()
         let micResult = micWriter.finalize(frames: frames)
-        let systemResult = systemWriter.finalize(frames: frames)
+        let systemResult = systemWriter?.finalize(frames: frames)
 
         eventsLock.withLock {
             session.end = iso8601.string(from: endDate)
             session.durationSeconds = (duration * 1000).rounded() / 1000
             session.frames = frames
-            session.capturedFrames = ["mic": micResult.captured, "system": systemResult.captured]
+            session.capturedFrames = ["mic": micResult.captured]
+            if let systemResult { session.capturedFrames?["system"] = systemResult.captured }
         }
         saveSession()
         say("")
         say("\(Style.strong("■", Style.accent)) \(Style.bold("stopped"))  \(clock(duration)) recorded")
-        say("  \(Style.dim("files  "))  mic.wav \(Style.faint("·")) system.wav \(Style.faint("·")) session.json  "
-            + Style.dim(String(format: "%lld frames each (%.3fs)", frames, Double(frames) / TrackWriter.sampleRate)))
+        let files = (systemWriter == nil ? ["mic.wav"] : ["mic.wav", "system.wav"]) + ["session.json"]
+        say("  \(Style.dim("files  "))  \(files.joined(separator: " \(Style.faint("·")) "))  "
+            + Style.dim(String(format: "%lld frames%@ (%.3fs)", frames, systemWriter == nil ? "" : " each", Double(frames) / TrackWriter.sampleRate)))
         say("  \(Style.dim("session"))  \(Style.path(dir.path))")
         if interactive, Style.enabled { writeOut("\u{1B}[?25h") }
         PIDFile.remove()

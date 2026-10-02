@@ -6,7 +6,8 @@ import Foundation
 /// timeline into `<DIR>/transcript.<engine>.json` and, for the default run
 /// (Parakeet, both tracks), a note in `<vault>/transcriptions/`.
 /// mic.wav is "Me"; remote voices are "Them", or "Speaker N" when the diarizer
-/// hears more than one.
+/// hears more than one. A dictation session (`rec start --dictate`) has only
+/// mic.wav and becomes a `Dictation` note without speaker labels.
 enum Transcriber {
     enum Channel: String, CaseIterable { case mic, system, both }
 
@@ -17,8 +18,10 @@ enum Transcriber {
         var splitGap = 0.6
         /// `~/.config/rec/vocab.json`: Parakeet keyword boosting, then alias → canonical on every engine.
         var vocabulary = true
+        /// Set from session.json: the session is mic only.
+        var dictation = false
         /// The note is the regular product; other engines and single tracks are experiments.
-        var writesNote: Bool { engine == .parakeet && channel == .both }
+        var writesNote: Bool { engine == .parakeet && channel == (dictation ? .mic : .both) }
     }
 
     static func run(_ args: [String], background: Bool = false) -> Never {
@@ -56,6 +59,14 @@ enum Transcriber {
             dir = latest
         } else {
             fail("no sessions in \(Paths.recordingsRoot.path)")
+        }
+        if readSession(dir)?.isDictation == true {
+            options.dictation = true
+            switch options.channel {
+            case .both: options.channel = .mic
+            case .system: fail("\(Style.path(dir.path)) is a dictation; it has no system audio", code: 64)
+            case .mic: break
+            }
         }
         let config = Config.load()
         if options.writesNote {
@@ -192,11 +203,11 @@ enum Transcriber {
         for (_, url) in tracks where !FileManager.default.fileExists(atPath: url.path) {
             throw TranscribeError("missing \(url.path)")
         }
-        let session = (try? Data(contentsOf: dir.appendingPathComponent("session.json")))
-            .flatMap { try? JSONDecoder().decode(SessionInfo.self, from: $0) }
+        let session = readSession(dir)
         let started = Date()
         let audio = session?.durationSeconds.map { "  " + Style.dim("\(shortDuration($0)) of audio") } ?? ""
-        let which = options.writesNote ? "" : "  " + Style.dim("\(options.engine.rawValue), \(options.channel.rawValue)")
+        let which = options.writesNote ? (options.dictation ? "  " + Style.dim("dictation") : "")
+            : "  " + Style.dim("\(options.engine.rawValue), \(options.channel.rawValue)")
         progress.line("\(Style.strong("◆", Style.accent)) \(Style.bold("transcribing"))  \(Style.path(dir.path))\(audio)\(which)")
 
         let vocabulary = options.vocabulary ? try Vocabulary.load() : nil
@@ -265,9 +276,10 @@ enum Transcriber {
                 ?? (try? FileManager.default.attributesOfItem(atPath: micURL.path)[.creationDate] as? Date)
                 ?? Date()
             let markdown = transcript.markdown(
-                start: startDate, duration: session?.durationSeconds, model: engine.model)
+                start: startDate, duration: session?.durationSeconds, model: engine.model, dictation: options.dictation)
             try Vault.ensureTranscriptionsDir(config)
-            let url = noteURL(in: config.transcriptionsDir, start: startDate, session: dir)
+            let url = noteURL(in: config.transcriptionsDir, start: startDate, session: dir,
+                              kind: options.dictation ? "Dictation" : "Transcript")
             try markdown.write(to: url, atomically: true, encoding: .utf8)
             try? url.lastPathComponent.write(to: dir.appendingPathComponent(noteRecord), atomically: true, encoding: .utf8)
             note = url
@@ -282,16 +294,16 @@ enum Transcriber {
     /// `<session>/.note`: the name of the session's note, so a re-run overwrites it.
     private static let noteRecord = ".note"
 
-    /// `2026-09-23 14-30 Transcript.md`. Re-running a session overwrites its own
+    /// `2026-09-23 14-30 Transcript.md` (or `… Dictation.md`). Re-running a session overwrites its own
     /// note; another session that started in the same minute gets a " 2" suffix.
-    private static func noteURL(in folder: URL, start: Date, session: URL) -> URL {
+    private static func noteURL(in folder: URL, start: Date, session: URL, kind: String) -> URL {
         if let name = try? String(contentsOf: session.appendingPathComponent(noteRecord), encoding: .utf8),
            !name.isEmpty, !name.contains("/") {
             return folder.appendingPathComponent(name)
         }
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH-mm"
-        let base = "\(f.string(from: start)) Transcript"
+        let base = "\(f.string(from: start)) \(kind)"
         // Notes written before `.note` carry the session in their frontmatter.
         let marker = "session: \(yamlString(session.path))\n"
         for n in 1... {
@@ -300,6 +312,11 @@ enum Transcriber {
             if existing.contains(marker) { return url }
         }
         fatalError("unreachable")
+    }
+
+    private static func readSession(_ dir: URL) -> SessionInfo? {
+        (try? Data(contentsOf: dir.appendingPathComponent("session.json")))
+            .flatMap { try? JSONDecoder().decode(SessionInfo.self, from: $0) }
     }
 
     private static func executablePath() -> String {
@@ -602,17 +619,25 @@ struct Transcript {
         word.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 
-    func markdown(start: Date, duration: Double?, model: String) -> String {
+    /// A dictation is one voice thinking aloud: `type: dictation` and a tag in
+    /// the frontmatter instead of speakers, and paragraphs without a name.
+    func markdown(start: Date, duration: Double?, model: String, dictation: Bool = false) -> String {
         let iso = ISO8601DateFormatter()
         iso.timeZone = .current
         iso.formatOptions = [.withInternetDateTime]
         var lines = ["---", "date: \(iso.string(from: start))"]
         if let duration { lines.append("duration: \(yamlString(clock(duration)))") }
-        lines.append("speakers:")
-        lines += speakerNames.map { "  - \(yamlString($0))" }
+        if dictation {
+            lines += ["type: dictation", "tags:", "  - dictation"]
+        } else {
+            lines.append("speakers:")
+            lines += speakerNames.map { "  - \(yamlString($0))" }
+        }
         lines += ["model: \(model)", "---", ""]
         if utterances.isEmpty {
             lines.append("_No speech detected._")
+        } else if dictation {
+            lines += utterances.map { "**[\(clock($0.start))]** \($0.text)\n" }
         } else {
             lines += utterances.map { "**[\(clock($0.start))] \($0.speaker):** \($0.text)\n" }
         }

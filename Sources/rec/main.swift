@@ -1,8 +1,9 @@
 import Foundation
 
 let usage = """
-usage: rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach]
+usage: rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach] [--dictate]
                                           record mic + system audio until `rec stop` / Ctrl-C
+                                          (--dictate: mic only, transcribed as a dictation note)
        rec stop                           stop the running recording
        rec status                         show whether a recording is running
        rec devices                        list input devices for --mic
@@ -41,8 +42,10 @@ case "open": Launcher.openRecordings()
 case "transcribe": Transcriber.run(Array(args.dropFirst()))
 case "_transcribe" where args.count == 2: Transcriber.run([args[1]], background: true)
 case "config": ConfigCommand.run(Array(args.dropFirst()))
-case "_record" where (2...3).contains(args.count):
-    Recorder(dir: URL(fileURLWithPath: args[1]), micUID: args.count == 3 ? args[2] : nil).run()
+case "_record" where args.count >= 2:
+    let rest = args.dropFirst(2)
+    Recorder(dir: URL(fileURLWithPath: args[1]), micUID: rest.first { !$0.hasPrefix("-") },
+             dictation: rest.contains("--dictate")).run()
 case nil, "-h", "--help", "help": print(usage)
 default: fail("unknown command \(args[0])\n\(usage)", code: 64)
 }
