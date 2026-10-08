@@ -15,6 +15,9 @@ rec devices                  # list inputs, their UIDs, and which one rec would 
 rec stop
 rec verify [SESSION_DIR]     # length / silence / sync check (default: latest session)
 rec open                     # open ~/Recordings/rec in Finder
+rec import                   # pick a Voice Memo, import it as a session and transcribe it
+rec import FILE              # any audio or video file (drag it into the terminal)
+             [--memo latest] [--as dictation|conversation] [--title TEXT] [--no-transcribe]
 rec transcribe [SESSION_DIR] # (re)transcribe a session into the vault (default: latest session)
              [--engine parakeet|whisper] [--channel mic|system|both]
 rec config                   # choose the Obsidian vault; --vault PATH, --model v2|v3, --show
@@ -24,9 +27,10 @@ Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
 
 | file          | contents |
 |---------------|----------|
-| `mic.wav`     | built-in mic, 16 kHz mono 16-bit |
-| `system.wav`  | everything the Mac plays, 16 kHz mono 16-bit (not in a dictation) |
-| `session.json`| `mode: "dictation"` for `--dictate`, start timestamp (ISO 8601 + epoch ms), end, duration, frame count, device UIDs, event log (gaps, device loss, silence warnings) |
+| `mic.wav`     | built-in mic, 16 kHz mono 16-bit (not in an import) |
+| `system.wav`  | everything the Mac plays, 16 kHz mono 16-bit (not in a dictation or an import) |
+| `audio.wav`   | an import's audio, mixed to 16 kHz mono 16-bit |
+| `session.json`| `mode: "dictation"` for `--dictate` or `"import"` (with `source`: original path, memo ID, title), start timestamp (ISO 8601 + epoch ms), end, duration, frame count, device UIDs, event log (gaps, device loss, silence warnings) |
 | `transcribe.log` | transcription progress and FluidAudio / Core ML diagnostics |
 | `transcript.<engine>.json` | words (per track), speakers, turns and timings from the last run of that engine |
 
@@ -95,6 +99,24 @@ and one line per turn:
 
   `rec transcribe` and `rec verify` read the mode from `session.json`, so they
   need no flag.
+- **Imports:** `rec import` with no file lists the Voice Memos on this Mac
+  (read from `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/CloudRecordings.db`),
+  newest first, with ✓ on ones already imported; `--memo latest` skips the list.
+  Reading that folder may need Full Disk Access for your terminal; exporting the
+  memo and passing the file always works. A file can be anything AVFoundation
+  decodes (m4a, mp3, wav, aiff, caf, or a video's sound). Every audio track is
+  mixed to mono, resampled to `audio.wav` in a session named after when it was
+  recorded (the memo's date, else the file's creation date), and transcribed
+  straight away like a recording that just stopped. The original isn't copied;
+  importing the same memo or file again finds its session.
+  There's no "Me" in an import: `audio.wav` is diarized like system audio. One
+  voice makes a Dictation note; several make a Transcript with "Speaker 1, 2…".
+  `--as dictation|conversation` overrides that (on `rec import` or later on
+  `rec transcribe`, and it's remembered in `session.json`). A memo you named, or
+  `--title`, names the note (`2026-10-08 12-41 Little Ruby's Cafe.md`) and goes
+  in the frontmatter as `title`, next to `source:` (the original file).
+  Imported sessions are dated when they were recorded, so a plain
+  `rec transcribe` (latest session) may not pick one; pass its directory.
 - Re-running `rec transcribe` on a session overwrites that session's note.
   It runs from the CLI, not Rec.app, so writing into a vault under `~/Documents`
   uses your terminal's file access.

@@ -359,7 +359,7 @@ enum Launcher {
 
     /// Transcripts need a vault: ask for one on first use, and make sure its
     /// transcriptions/ folder is still there. Recording goes ahead either way.
-    private static func checkTranscription(interactive: Bool) {
+    static func checkTranscription(interactive: Bool) {
         guard let config = Config.load() else {
             if interactive {
                 _ = ConfigCommand.firstRun()

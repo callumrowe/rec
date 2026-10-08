@@ -9,14 +9,22 @@ struct SessionInfo: Codable {
         let message: String
     }
 
+    /// Where `rec import` got the audio from.
+    struct Source: Codable {
+        var path: String
+        var memoID: String?
+        var title: String?
+    }
+
     var version = 1
-    /// "dictation" for `rec start --dictate` (mic only); absent for a meeting (mic + system audio).
+    /// "dictation" for `rec start --dictate` (mic only), "import" for `rec import` (audio.wav only);
+    /// absent for a meeting (mic + system audio).
     var mode: String?
     var start: String
     var startEpochMs: Int64
     var sampleRate = Int(TrackWriter.sampleRate)
     var files = ["mic": "mic.wav", "system": "system.wav"]
-    var micDeviceUID: String
+    var micDeviceUID: String?
     var micName: String?
     var systemClockDeviceUID: String?
     var end: String?
@@ -24,8 +32,12 @@ struct SessionInfo: Codable {
     var frames: Int64?
     var capturedFrames: [String: Int64]?
     var events: [Event] = []
+    var source: Source?
+    /// An import's `--as dictation|conversation`; absent means decided by how many voices the diarizer hears.
+    var importAs: String?
 
     var isDictation: Bool { mode == "dictation" }
+    var isImport: Bool { mode == "import" }
 }
 
 let iso8601: ISO8601DateFormatter = {

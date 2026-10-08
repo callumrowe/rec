@@ -1,13 +1,16 @@
 import FluidAudio
 import Foundation
 
-/// `rec transcribe [DIR] [--engine parakeet|whisper] [--channel mic|system|both] [--split-gap SECONDS] [--no-vocab]`:
+/// `rec transcribe [DIR] [--engine parakeet|whisper] [--channel mic|system|both] [--as dictation|conversation]
+///   [--split-gap SECONDS] [--no-vocab]`:
 /// ASR on the tracks, speaker diarization on system.wav, merged on the shared
 /// timeline into `<DIR>/transcript.<engine>.json` and, for the default run
 /// (Parakeet, both tracks), a note in `<vault>/transcriptions/`.
 /// mic.wav is "Me"; remote voices are "Them", or "Speaker N" when the diarizer
 /// hears more than one. A dictation session (`rec start --dictate`) has only
-/// mic.wav and becomes a `Dictation` note without speaker labels.
+/// mic.wav and becomes a `Dictation` note without speaker labels. An import
+/// (`rec import`) has only audio.wav, which is diarized like system audio: one
+/// voice makes a Dictation note, several a Transcript with "Speaker N" labels.
 enum Transcriber {
     enum Channel: String, CaseIterable { case mic, system, both }
 
@@ -20,6 +23,10 @@ enum Transcriber {
         var vocabulary = true
         /// Set from session.json: the session is mic only.
         var dictation = false
+        /// Set from session.json: `rec import`, one track in audio.wav.
+        var imported = false
+        /// An import's note type; nil decides by the number of voices heard.
+        var importAs: ImportKind?
         /// The note is the regular product; other engines and single tracks are experiments.
         var writesNote: Bool { engine == .parakeet && channel == (dictation ? .mic : .both) }
     }
@@ -46,6 +53,10 @@ enum Transcriber {
                 let v = value(arg)
                 guard let g = Double(v), g > 0 else { fail("--split-gap must be a number of seconds above 0, not \(v)", code: 64) }
                 options.splitGap = g
+            case "--as":
+                let v = value(arg)
+                guard let k = ImportKind(rawValue: v) else { fail("--as must be dictation or conversation, not \(v)", code: 64) }
+                options.importAs = k
             case "--no-vocab": options.vocabulary = false
             case _ where arg.hasPrefix("-"): fail("unknown option \(arg)\n\(usage)", code: 64)
             case _ where path == nil: path = arg
@@ -60,7 +71,22 @@ enum Transcriber {
         } else {
             fail("no sessions in \(Paths.recordingsRoot.path)")
         }
-        if readSession(dir)?.isDictation == true {
+        let session = readSession(dir)
+        if session?.isImport == true {
+            options.imported = true
+            guard options.channel == .both else { fail("\(Style.path(dir.path)) is an import; it has one track", code: 64) }
+            if let kind = options.importAs, var session, session.importAs != kind.rawValue {
+                // Remember the override, so a plain `rec transcribe` later doesn't go back to guessing.
+                session.importAs = kind.rawValue
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try? encoder.encode(session).write(to: dir.appendingPathComponent("session.json"))
+            }
+            options.importAs = options.importAs ?? session?.importAs.flatMap(ImportKind.init)
+        } else if options.importAs != nil {
+            fail("--as is for sessions made with `rec import`", code: 64)
+        }
+        if session?.isDictation == true {
             options.dictation = true
             switch options.channel {
             case .both: options.channel = .mic
@@ -198,15 +224,18 @@ enum Transcriber {
 
     private static func transcribe(dir: URL, options: Options, config: Config?) async throws -> (json: URL, note: URL?) {
         let micURL = dir.appendingPathComponent("mic.wav")
-        let systemURL = dir.appendingPathComponent("system.wav")
-        let tracks = [(Channel.mic, micURL), (.system, systemURL)].filter { options.channel == .both || options.channel == $0.0 }
+        // An import's one track goes through the system-audio path: diarized, no "Me".
+        let systemURL = dir.appendingPathComponent(options.imported ? "audio.wav" : "system.wav")
+        let tracks = options.imported ? [(Channel.system, systemURL)]
+            : [(Channel.mic, micURL), (.system, systemURL)].filter { options.channel == .both || options.channel == $0.0 }
         for (_, url) in tracks where !FileManager.default.fileExists(atPath: url.path) {
             throw TranscribeError("missing \(url.path)")
         }
         let session = readSession(dir)
         let started = Date()
         let audio = session?.durationSeconds.map { "  " + Style.dim("\(shortDuration($0)) of audio") } ?? ""
-        let which = options.writesNote ? (options.dictation ? "  " + Style.dim("dictation") : "")
+        let which = options.imported ? "  " + Style.dim(["import", session?.source?.title].compactMap { $0 }.joined(separator: ", "))
+            : options.writesNote ? (options.dictation ? "  " + Style.dim("dictation") : "")
             : "  " + Style.dim("\(options.engine.rawValue), \(options.channel.rawValue)")
         progress.line("\(Style.strong("◆", Style.accent)) \(Style.bold("transcribing"))  \(Style.path(dir.path))\(audio)\(which)")
 
@@ -219,10 +248,10 @@ enum Transcriber {
 
         var words: [Channel: [Word]] = [:]
         for (channel, url) in tracks {
-            let label = channel == .mic ? "transcribing mic" : "transcribing system audio"
+            let label = channel == .mic ? "transcribing mic" : options.imported ? "transcribing audio" : "transcribing system audio"
             progress.begin(label)
             words[channel] = try await engine.words(in: url) { progress.update("\(label)  \(Style.dim($0))") }
-            progress.end(Style.event("✓ \(channel.rawValue): \(words[channel]!.count) words"))
+            progress.end(Style.event("✓ \(options.imported ? "audio" : channel.rawValue): \(words[channel]!.count) words"))
         }
         await engine.unload()
         let timing = TranscriptFile.Timing(
@@ -243,8 +272,9 @@ enum Transcriber {
         let systemWords = words[.system] ?? []
 
         var speakers: [Transcript.SpeakerSpan] = []
-        if !systemWords.isEmpty {
-            progress.begin("finding speakers in system audio")
+        let source = options.imported ? "" : " in system audio"
+        if !systemWords.isEmpty, options.importAs != .dictation {
+            progress.begin("finding speakers\(source)")
             do {
                 let diarizer = OfflineDiarizerManager(config: OfflineDiarizerConfig())
                 try await diarizer.prepareModels()
@@ -252,17 +282,25 @@ enum Transcriber {
                     .init(id: $0.speakerId, start: Double($0.startTimeSeconds), end: Double($0.endTimeSeconds))
                 }
                 for s in speakers { fputs(String(format: "diarization: %@ %.2f–%.2f\n", s.id, s.start, s.end), stderr) }
-                progress.end(Style.event("✓ speakers: \(Set(speakers.map(\.id)).count) in system audio"))
+                progress.end(Style.event("✓ speakers: \(Set(speakers.map(\.id)).count)\(source)"))
             } catch {
                 // Still worth a transcript; remote speech is just labelled "Them".
-                progress.end(Style.event("⚠ diarization failed (\(error.localizedDescription)); labelling remote speech \"Them\""))
+                progress.end(Style.event("⚠ diarization failed (\(error.localizedDescription)); labelling \(options.imported ? "it all one voice" : "remote speech \"Them\"")"))
             }
         }
+        var dictation = options.dictation
+        if options.imported {
+            let voices = Set(speakers.map(\.id)).count
+            dictation = options.importAs.map { $0 == .dictation } ?? (voices <= 1)
+            let why = options.importAs != nil ? "--as \(options.importAs!.rawValue)" : voices <= 1 ? "one voice" : "\(voices) voices"
+            progress.line(Style.event("✓ \(dictation ? "dictation" : "conversation") note (\(why))"))
+        }
 
-        let transcript = Transcript(mic: micWords, system: systemWords, speakers: speakers, splitGap: options.splitGap)
+        let transcript = Transcript(mic: micWords, system: systemWords, speakers: speakers, splitGap: options.splitGap,
+                                    soleSpeaker: options.imported ? "Speaker 1" : "Them")
         let json = dir.appendingPathComponent("transcript.\(engine.id).json")
         try TranscriptFile(
-            engine: engine.id, model: engine.model, channel: options.channel.rawValue, session: dir.path,
+            engine: engine.id, model: engine.model, channel: options.imported ? "audio" : options.channel.rawValue, session: dir.path,
             created: Date(), splitGap: options.splitGap, vocabulary: vocabulary?.terms.map(\.text), timing: timing,
             words: .init(mic: words[.mic].map(TranscriptFile.words), system: words[.system].map(TranscriptFile.words)),
             speakers: speakers.map { .init(id: $0.id, start: $0.start, end: $0.end) },
@@ -275,17 +313,20 @@ enum Transcriber {
             let startDate = session.map { Date(timeIntervalSince1970: Double($0.startEpochMs) / 1000) }
                 ?? (try? FileManager.default.attributesOfItem(atPath: micURL.path)[.creationDate] as? Date)
                 ?? Date()
+            let title = session?.source?.title
             let markdown = transcript.markdown(
-                start: startDate, duration: session?.durationSeconds, model: engine.model, dictation: options.dictation)
+                start: startDate, duration: session?.durationSeconds, model: engine.model, dictation: dictation,
+                title: title, source: session?.source?.path)
             try Vault.ensureTranscriptionsDir(config)
             let url = noteURL(in: config.transcriptionsDir, start: startDate, session: dir,
-                              kind: options.dictation ? "Dictation" : "Transcript")
+                              kind: title.map(fileNameSafe) ?? (dictation ? "Dictation" : "Transcript"))
             try markdown.write(to: url, atomically: true, encoding: .utf8)
             try? url.lastPathComponent.write(to: dir.appendingPathComponent(noteRecord), atomically: true, encoding: .utf8)
             note = url
         }
-        progress.line(Style.dim(String(format: "  %d paragraphs (%d segments), %d echo words dropped from the mic, %@ in all",
-                                       transcript.utterances.count, transcript.segments.count, transcript.droppedEcho,
+        let echo = options.imported ? "" : "\(transcript.droppedEcho) echo words dropped from the mic, "
+        progress.line(Style.dim(String(format: "  %d paragraphs (%d segments), %@%@ in all",
+                                       transcript.utterances.count, transcript.segments.count, echo,
                                        shortDuration(Date().timeIntervalSince(started)))))
         for line in TranscriptFile.timingSummary(dir: dir, current: engine.id) { progress.line(line) }
         return (json, note)
@@ -294,7 +335,13 @@ enum Transcriber {
     /// `<session>/.note`: the name of the session's note, so a re-run overwrites it.
     private static let noteRecord = ".note"
 
-    /// `2026-09-23 14-30 Transcript.md` (or `… Dictation.md`). Re-running a session overwrites its own
+    /// A title as a file name: no path separators or leading dot, at most 80 characters.
+    private static func fileNameSafe(_ title: String) -> String {
+        let cleaned = title.map { "/:\\".contains($0) ? "-" : $0 }.drop { $0 == "." }
+        return String(String(cleaned).prefix(80)).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// `2026-09-23 14-30 Transcript.md` (or `… Dictation.md`, or an import's `… <title>.md`). Re-running a session overwrites its own
     /// note; another session that started in the same minute gets a " 2" suffix.
     private static func noteURL(in folder: URL, start: Date, session: URL, kind: String) -> URL {
         if let name = try? String(contentsOf: session.appendingPathComponent(noteRecord), encoding: .utf8),
@@ -346,6 +393,7 @@ struct TranscribeError: LocalizedError {
 /// turns into a summary line when the step ends.
 final class TranscribeProgress: @unchecked Sendable {
     private let terminal: Int32?
+    private let logs: Bool
     private let live: Bool
     private let lock = NSLock()
     private var step: (label: String, start: Date)?
@@ -355,8 +403,10 @@ final class TranscribeProgress: @unchecked Sendable {
     private var savedTerm: termios?
     private static let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-    init(terminal: Int32?) {
+    /// `logs`: also print each line, unstyled, to stdout (which `rec transcribe` points at its log).
+    init(terminal: Int32?, logs: Bool = true) {
         self.terminal = terminal
+        self.logs = logs
         live = terminal.map { isatty($0) != 0 } == true && Style.enabled
         guard live else { return }
         // Keystrokes (and "^C") would land in the middle of the spinner line.
@@ -453,6 +503,7 @@ final class TranscribeProgress: @unchecked Sendable {
     }
 
     private func log(_ message: String) {
+        guard logs else { return }
         print(Style.plain(message))
         fflush(stdout)
     }
@@ -481,7 +532,8 @@ struct Transcript {
     /// Mic words dropped because they were the speakers leaking into the mic.
     private(set) var droppedEcho = 0
 
-    init(mic: [Word], system: [Word], speakers: [SpeakerSpan], splitGap: Double = 0.6) {
+    /// `soleSpeaker`: the label when the diarizer finds one remote voice (or none).
+    init(mic: [Word], system: [Word], speakers: [SpeakerSpan], splitGap: Double = 0.6, soleSpeaker: String = "Them") {
         // Remote speech: cut into sentences (or pause-separated fragments), then
         // give each the diarized speaker most of its words fall in, so a label
         // can't flip mid-sentence. Speakers are numbered in order of first speech.
@@ -493,10 +545,10 @@ struct Transcript {
         var order: [String] = []
         for case let id? in ids where !order.contains(id) { order.append(id) }
         let remote = Dictionary(uniqueKeysWithValues: order.enumerated().map { i, id in
-            (id, order.count > 1 ? "Speaker \(i + 1)" : "Them")
+            (id, order.count > 1 ? "Speaker \(i + 1)" : soleSpeaker)
         })
         let labelled = zip(phrases, ids).flatMap { phrase, id in
-            phrase.words.map { ($0, id.flatMap { remote[$0] } ?? "Them") }
+            phrase.words.map { ($0, id.flatMap { remote[$0] } ?? soleSpeaker) }
         }
         let remoteTurns = Self.turns(labelled, gap: splitGap)
 
@@ -526,7 +578,7 @@ struct Transcript {
         self.segments = segments.map(Self.utterance)
         utterances = Self.paragraphs(segments).map(Self.utterance)
         speakerNames = (micTurns.isEmpty ? [] : ["Me"])
-            + (order.isEmpty ? (remoteTurns.isEmpty ? [] : ["Them"]) : order.compactMap { remote[$0] })
+            + (order.isEmpty ? (remoteTurns.isEmpty ? [] : [soleSpeaker]) : order.compactMap { remote[$0] })
     }
 
     /// The diarized speaker most of these words fall in (by word midpoint), or
@@ -621,11 +673,15 @@ struct Transcript {
 
     /// A dictation is one voice thinking aloud: `type: dictation` and a tag in
     /// the frontmatter instead of speakers, and paragraphs without a name.
-    func markdown(start: Date, duration: Double?, model: String, dictation: Bool = false) -> String {
+    /// An import adds its title (if any) and the original file as `source`.
+    func markdown(start: Date, duration: Double?, model: String, dictation: Bool = false,
+                  title: String? = nil, source: String? = nil) -> String {
         let iso = ISO8601DateFormatter()
         iso.timeZone = .current
         iso.formatOptions = [.withInternetDateTime]
-        var lines = ["---", "date: \(iso.string(from: start))"]
+        var lines = ["---"]
+        if let title { lines.append("title: \(yamlString(title))") }
+        lines.append("date: \(iso.string(from: start))")
         if let duration { lines.append("duration: \(yamlString(clock(duration)))") }
         if dictation {
             lines += ["type: dictation", "tags:", "  - dictation"]
@@ -633,6 +689,7 @@ struct Transcript {
             lines.append("speakers:")
             lines += speakerNames.map { "  - \(yamlString($0))" }
         }
+        if let source { lines.append("source: \(yamlString(source))") }
         lines += ["model: \(model)", "---", ""]
         if utterances.isEmpty {
             lines.append("_No speech detected._")

@@ -6,7 +6,7 @@ import Foundation
 /// the call plays through the speakers the mic hears it a few ms later, and that
 /// lag should stay constant for the whole recording. With headphones the mic
 /// can't hear the call and sync can't be measured this way. A dictation has
-/// only mic.wav, so only its silence is checked.
+/// only mic.wav and an import only audio.wav, so only their silence is checked.
 enum Verify {
     static func run(_ args: [String]) -> Never {
         let dir: URL
@@ -19,12 +19,15 @@ enum Verify {
         }
         print("\(Style.dim("session"))  \(Style.path(dir.path))")
         print("")
-        let dictation = (try? Data(contentsOf: dir.appendingPathComponent("session.json")))
-            .flatMap { try? JSONDecoder().decode(SessionInfo.self, from: $0) }?.isDictation == true
+        let session = (try? Data(contentsOf: dir.appendingPathComponent("session.json")))
+            .flatMap { try? JSONDecoder().decode(SessionInfo.self, from: $0) }
+        // A session with one track: its name and how the length row describes it.
+        let single: (track: String, note: String)? = session?.isImport == true ? ("audio", "imported, one track")
+            : session?.isDictation == true ? ("mic", "dictation, mic only") : nil
         let mic: WAVData, system: WAVData?
         do {
-            mic = try WAVData(url: dir.appendingPathComponent("mic.wav"))
-            system = dictation ? nil : try WAVData(url: dir.appendingPathComponent("system.wav"))
+            mic = try WAVData(url: dir.appendingPathComponent("\(single?.track ?? "mic").wav"))
+            system = single != nil ? nil : try WAVData(url: dir.appendingPathComponent("system.wav"))
         } catch {
             fail("cannot read WAVs: \(error.localizedDescription)")
         }
@@ -50,9 +53,9 @@ enum Verify {
 
         var ok = true
         let rate = Double(mic.sampleRate)
-        guard let system else {
-            row(true, "length", "\(clock(Double(mic.samples.count) / rate))\(sep)\(Style.dim("dictation, mic only"))")
-            verdict(trackRow("mic", mic) && mic.sampleRate == 16_000)
+        guard let system, single == nil else {
+            row(true, "length", "\(clock(Double(mic.samples.count) / rate))\(sep)\(Style.dim(single!.note))")
+            verdict(trackRow(single!.track, mic) && mic.sampleRate == 16_000)
         }
         let sameLength = mic.samples.count == system.samples.count
         if sameLength {
