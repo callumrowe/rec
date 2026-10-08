@@ -9,9 +9,13 @@ usage: rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach] [--dictate]
        rec devices                        list input devices for --mic
        rec verify [DIR]                   check a session (default: latest) for length, silence, sync
        rec open                           open the recordings folder in Finder
+       rec import [FILE] [--memo latest]  turn a Voice Memo (picked from a list) or any audio/video file
+         [--as dictation|conversation]    into a session and transcribe it; --as overrides the guess
+         [--title TEXT] [--no-transcribe] from how many voices it hears
        rec transcribe [DIR]               transcribe a session (default: latest) into the Obsidian vault
          [--engine parakeet|whisper]      A/B another engine (Whisper runs on VAD speech regions only)
          [--channel mic|system|both]      one track; only parakeet + both writes the note
+         [--as dictation|conversation]    for an import: override the note type
          [--split-gap 0.6]                a pause this long (seconds) starts a new line
          [--no-vocab]                     skip ~/.config/rec/vocab.json (boosting and alias fixes)
        rec config [--vault PATH] [--model v2|v3] [--show]
@@ -39,6 +43,7 @@ case "status": Launcher.status()
 case "devices": Launcher.devices()
 case "verify": Verify.run(Array(args.dropFirst()))
 case "open": Launcher.openRecordings()
+case "import": Importer.run(Array(args.dropFirst()))
 case "transcribe": Transcriber.run(Array(args.dropFirst()))
 case "_transcribe" where args.count == 2: Transcriber.run([args[1]], background: true)
 case "config": ConfigCommand.run(Array(args.dropFirst()))
