@@ -6,6 +6,8 @@ struct Config: Codable {
     var vault: String
     /// Parakeet model: "v2" (English, default) or "v3" (25 European languages).
     var model: String?
+    /// The menu bar talk-time dot and the note's talk stats; absent means the defaults.
+    var talk: TalkSettings?
 
     static let url = Paths.home.appendingPathComponent(".config/rec/config.json")
 
@@ -104,6 +106,11 @@ enum ConfigCommand {
             print("vault: \(current.vault)")
             print("transcripts: \(current.transcriptionsDir.path)")
             print("model: \(current.model ?? "v2")")
+            let talk = current.talk ?? TalkSettings()
+            print(talk.isEnabled
+                ? String(format: "talk: amber %gs, red %gs, gap %gs, interrupt %gs, seconds %@",
+                         talk.amber, talk.red, talk.gap, talk.interrupt, talk.seconds ? "shown" : "hidden")
+                : "talk: off")
             print("config: \(Config.url.path)")
             exit(0)
         }
@@ -119,7 +126,7 @@ enum ConfigCommand {
             guard let chosen = promptForVault(current: current?.vault) else { fail("no vault chosen") }
             path = chosen
         }
-        let config = Config(vault: path, model: model ?? current?.model)
+        let config = Config(vault: path, model: model ?? current?.model, talk: current?.talk)
         apply(config)
         exit(0)
     }

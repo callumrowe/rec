@@ -314,9 +314,10 @@ enum Transcriber {
                 ?? (try? FileManager.default.attributesOfItem(atPath: micURL.path)[.creationDate] as? Date)
                 ?? Date()
             let title = session?.source?.title
+            let talk = dictation || options.imported ? nil : await talkStats(dir: dir, config: config)
             let markdown = transcript.markdown(
                 start: startDate, duration: session?.durationSeconds, model: engine.model, dictation: dictation,
-                title: title, source: session?.source?.path)
+                title: title, source: session?.source?.path, talk: talk)
             try Vault.ensureTranscriptionsDir(config)
             let url = noteURL(in: config.transcriptionsDir, start: startDate, session: dir,
                               kind: title.map(fileNameSafe) ?? (dictation ? "Dictation" : "Transcript"))
@@ -330,6 +331,24 @@ enum Transcriber {
                                        shortDuration(Date().timeIntervalSince(started)))))
         for line in TranscriptFile.timingSummary(dir: dir, current: engine.id) { progress.line(line) }
         return (json, note)
+    }
+
+    /// A meeting's talk stats from the talk.json the recorder wrote, else measured from
+    /// the WAVs now (and saved). Nil if turned off or the VAD fails; the note just goes without.
+    private static func talkStats(dir: URL, config: Config) async -> TalkFile.Stats? {
+        let settings = config.talk ?? TalkSettings()
+        guard settings.isEnabled else { return nil }
+        if let file = TalkFile.read(dir) { return file.stats }
+        progress.begin("measuring talk time")
+        do {
+            let file = try await TalkMonitor.analyze(dir: dir, settings: settings)
+            try? file.write(to: dir)
+            progress.end(Style.event("✓ talk: \(file.summary)"))
+            return file.stats
+        } catch {
+            progress.end(Style.event("⚠ talk time unavailable (\(error.localizedDescription)); note written without it"))
+            return nil
+        }
     }
 
     /// `<session>/.note`: the name of the session's note, so a re-run overwrites it.
@@ -675,7 +694,7 @@ struct Transcript {
     /// the frontmatter instead of speakers, and paragraphs without a name.
     /// An import adds its title (if any) and the original file as `source`.
     func markdown(start: Date, duration: Double?, model: String, dictation: Bool = false,
-                  title: String? = nil, source: String? = nil) -> String {
+                  title: String? = nil, source: String? = nil, talk: TalkFile.Stats? = nil) -> String {
         let iso = ISO8601DateFormatter()
         iso.timeZone = .current
         iso.formatOptions = [.withInternetDateTime]
@@ -688,6 +707,11 @@ struct Transcript {
         } else {
             lines.append("speakers:")
             lines += speakerNames.map { "  - \(yamlString($0))" }
+        }
+        if let talk {
+            lines.append("my_talk_ratio: \(talk.myTalkRatio)")
+            lines.append("longest_turn: \(yamlString(minutesSeconds(talk.longestTurnSeconds)))")
+            lines.append("turns_over_90s: \(talk.turnsOver90s)")
         }
         if let source { lines.append("source: \(yamlString(source))") }
         lines += ["model: \(model)", "---", ""]

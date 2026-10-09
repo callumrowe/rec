@@ -31,6 +31,7 @@ Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
 | `system.wav`  | everything the Mac plays, 16 kHz mono 16-bit (not in a dictation or an import) |
 | `audio.wav`   | an import's audio, mixed to 16 kHz mono 16-bit |
 | `session.json`| `mode: "dictation"` for `--dictate` or `"import"` (with `source`: original path, memo ID, title), start timestamp (ISO 8601 + epoch ms), end, duration, frame count, device UIDs, event log (gaps, device loss, silence warnings) |
+| `talk.json`   | a meeting's VAD timeline: speech regions per track, your turns and the talk stats (see [Talk time](#talk-time)) |
 | `transcribe.log` | transcription progress and FluidAudio / Core ML diagnostics |
 | `transcript.<engine>.json` | words (per track), speakers, turns and timings from the last run of that engine |
 
@@ -49,7 +50,8 @@ cancels it (`rec transcribe` picks it up later); closing the terminal doesn't.
 A `--detach`ed recording is transcribed in the background instead, and a
 notification says when the note is ready. Either way the note is
 `<vault>/transcriptions/2026-09-23 14-30 Transcript.md`, with YAML frontmatter
-(date, duration, mic, speakers, session path, model, `tags: [transcript]`)
+(date, duration, mic, speakers, session path, model, `tags: [transcript]`,
+and the [talk stats](#talk-time) `my_talk_ratio`, `longest_turn`, `turns_over_90s`)
 and one line per turn:
 
 ```
@@ -120,6 +122,40 @@ and one line per turn:
 - Re-running `rec transcribe` on a session overwrites that session's note.
   It runs from the CLI, not Rec.app, so writing into a vault under `~/Documents`
   uses your terminal's file access.
+
+## Talk time
+
+While a meeting records, a dot in the menu bar shows how long your current turn has
+lasted: a hollow ring while you're not talking, green while you are, amber from 60 s,
+red from 90 s, with the elapsed seconds beside it. There are no notifications,
+sounds or popups. The dot is a status item, not a window, so sharing a window never
+shows it. It also asks to be left out of full-screen captures, but whether that's
+honoured depends on the sharing app.
+
+- FluidAudio's Silero VAD runs on both tracks in 256 ms chunks, on its own task:
+  the track writers only copy samples into a buffer for it, so it can't stall capture.
+  If the VAD falls more than 30 s behind, the oldest audio is skipped (counted as
+  silence). If the model fails to load or errors, the dot disappears and recording
+  and transcription carry on as usual.
+- Your turn starts when the mic has speech. Pauses shorter than 2 s keep the turn
+  going. It ends at your last speech once you've been quiet for 2 s or the system
+  track has had speech for 1 s (so an "mm-hm" doesn't end it).
+- Echo: mic speech while the system track is speaking, or within ~0.5 s after,
+  is treated as the call coming through your mic, not you.
+- On stop the timeline is saved to `talk.json` and summarised
+  (`talk  you 63% · longest 04:45 · 5 turns over 90s`). The note's frontmatter gets
+  `my_talk_ratio` (your speech as a % of all speech), `longest_turn` (mm:ss) and
+  `turns_over_90s`. A meeting without `talk.json` (recorded before this, or the
+  live VAD failed) is measured from its WAVs during `rec transcribe`. Dictations and
+  imports don't get the dot or the stats.
+- Settings go in `~/.config/rec/config.json` under `talk` (all optional; these are the defaults):
+
+  ```json
+  "talk": {"enabled": true, "amberSeconds": 60, "redSeconds": 90,
+           "gapSeconds": 2, "interruptSeconds": 1, "showSeconds": true}
+  ```
+
+  `turns_over_90s` always counts turns over 90 s, whatever `redSeconds` is.
 
 ## How it works
 
