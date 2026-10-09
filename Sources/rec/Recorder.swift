@@ -64,6 +64,8 @@ final class Recorder {
     private var mic: MicCapture!
     private var system: SystemTap?
     private var lastSystemRestart = Date.distantPast
+    private var talk: TalkMonitor?
+    private var indicator: TalkIndicator?
 
     private var silentSince: [String: Date] = [:]
     private var silenceWarned: Set<String> = []
@@ -133,6 +135,18 @@ final class Recorder {
         say("")
         if interactive, Style.enabled { writeOut("\u{1B}[?25l") }
 
+        // Meetings only: the menu bar dot for how long you've been talking.
+        let talkSettings = Config.load()?.talk ?? TalkSettings()
+        if let systemWriter, talkSettings.isEnabled {
+            let talk = TalkMonitor(settings: talkSettings, system: true, log: log)
+            micWriter.listener = { talk.feed(.mic, $0, count: $1) }
+            systemWriter.listener = { talk.feed(.system, $0, count: $1) }
+            talk.start()
+            self.talk = talk
+            NSApplication.shared.setActivationPolicy(.accessory)
+            indicator = TalkIndicator(settings: talkSettings)
+        }
+
         if let systemWriter {
             system = SystemTap(writer: systemWriter)
             startSystem()
@@ -150,7 +164,7 @@ final class Recorder {
             source.resume()
             keepAlive.append(source)
         }
-        RunLoop.main.run()
+        NSApplication.shared.run()
         exit(0)
     }
 
@@ -184,6 +198,15 @@ final class Recorder {
     private func tick() {
         guard !stopping else { return }
         ticks += 1
+        if let talk, let indicator {
+            let state = talk.state
+            if state == .unavailable {
+                indicator.remove()
+                self.indicator = nil
+            } else {
+                indicator.update(state)
+            }
+        }
         let micMeter = micWriter.takeMeter()
         let systemMeter = systemWriter?.takeMeter()
 
@@ -318,6 +341,16 @@ final class Recorder {
         system?.stop()
         let micResult = micWriter.finalize(frames: frames)
         let systemResult = systemWriter?.finalize(frames: frames)
+        indicator?.remove()
+        var talkFile: TalkFile?
+        if let file = talk?.finish(timeout: 3) {
+            do {
+                try file.write(to: dir)
+                talkFile = file
+            } catch {
+                log("talk: cannot write talk.json: \(error.localizedDescription)")
+            }
+        }
 
         eventsLock.withLock {
             session.end = iso8601.string(from: endDate)
@@ -329,9 +362,10 @@ final class Recorder {
         saveSession()
         say("")
         say("\(Style.strong("■", Style.accent)) \(Style.bold("stopped"))  \(clock(duration)) recorded")
-        let files = (systemWriter == nil ? ["mic.wav"] : ["mic.wav", "system.wav"]) + ["session.json"]
+        let files = (systemWriter == nil ? ["mic.wav"] : ["mic.wav", "system.wav"]) + ["session.json"] + (talkFile == nil ? [] : ["talk.json"])
         say("  \(Style.dim("files  "))  \(files.joined(separator: " \(Style.faint("·")) "))  "
             + Style.dim(String(format: "%lld frames%@ (%.3fs)", frames, systemWriter == nil ? "" : " each", Double(frames) / TrackWriter.sampleRate)))
+        if let talkFile { say("  \(Style.dim("talk   "))  \(talkFile.summary)") }
         say("  \(Style.dim("session"))  \(Style.path(dir.path))")
         if interactive, Style.enabled { writeOut("\u{1B}[?25h") }
         PIDFile.remove()

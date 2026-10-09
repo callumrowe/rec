@@ -20,6 +20,9 @@ final class TrackWriter {
     let name: String
     /// All `process` calls must happen on this queue.
     let queue: DispatchQueue
+    /// Called on `queue` with what was just appended to the file: samples, or nil for
+    /// `count` frames of padded silence. Set before capture starts; must be quick.
+    var listener: ((_ samples: UnsafeBufferPointer<Float>?, _ count: Int) -> Void)?
 
     private let wav: WAVWriter
     private let t0: UInt64
@@ -96,11 +99,16 @@ final class TrackWriter {
                     smallCorrections += 1
                 }
                 try wav.appendSilence(delta)
+                listener?(nil, Int(delta))
             } else if delta < -tolerance {
                 skip = min(n, Int(-delta))
                 if written > 0 { smallCorrections += 1 }  // at written == 0 it's just audio from before t0
             }
-            if skip < n { try wav.append(UnsafeBufferPointer(rebasing: samples[skip...])) }
+            if skip < n {
+                let kept = UnsafeBufferPointer(rebasing: samples[skip...])
+                try wav.append(kept)
+                listener?(kept, kept.count)
+            }
         } catch {
             if !writeFailed { log("\(name): write failed: \(error.localizedDescription)") }
             writeFailed = true

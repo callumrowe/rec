@@ -47,6 +47,7 @@ case "import": Importer.run(Array(args.dropFirst()))
 case "transcribe": Transcriber.run(Array(args.dropFirst()))
 case "_transcribe" where args.count == 2: Transcriber.run([args[1]], background: true)
 case "config": ConfigCommand.run(Array(args.dropFirst()))
+case "_talk": TalkCommand.run(Array(args.dropFirst()))
 case "_record" where args.count >= 2:
     let rest = args.dropFirst(2)
     Recorder(dir: URL(fileURLWithPath: args[1]), micUID: rest.first { !$0.hasPrefix("-") },
