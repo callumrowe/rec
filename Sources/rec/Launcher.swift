@@ -54,6 +54,7 @@ enum Launcher {
         var dictate = false
         var skipPicker = false
         var micQuery: String?
+        var trigger: String?
         var it = args.makeIterator()
         while let arg = it.next() {
             switch arg {
@@ -66,6 +67,9 @@ enum Launcher {
             case "-y", "--yes": skipPicker = true
             case "-d", "--detach": detach = true
             case "--dictate": dictate = true
+            case "--trigger":  // from `rec watch`: which call app this recording is for
+                guard let value = it.next() else { fail("--trigger needs a name", code: 64) }
+                trigger = value
             default: fail("unknown option \(arg)", code: 64)
             }
         }
@@ -102,7 +106,7 @@ enum Launcher {
         guard let app = appBundle() else {
             // Development build outside Rec.app: TCC will attribute capture to the terminal.
             fputs("\(Style.warn) not running from Rec.app; recording in-process (permissions belong to your terminal)\n", stderr)
-            Recorder(dir: dir, micUID: micUID, dictation: dictate).run()
+            Recorder(dir: dir, micUID: micUID, dictation: dictate, trigger: trigger).run()
         }
 
         // Launch through LaunchServices so Rec.app is its own "responsible process"
@@ -120,7 +124,7 @@ enum Launcher {
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         open.arguments = ["-n", "-g"] + forwarded
             + ["--stdout", output, "--stderr", output, app.path, "--args", "_record", dir.path, micUID]
-            + (dictate ? ["--dictate"] : [])
+            + (dictate ? ["--dictate"] : []) + (trigger.map { ["--trigger=\($0)"] } ?? [])
         do {
             try open.run()
             open.waitUntilExit()
@@ -376,7 +380,9 @@ enum Launcher {
     }
 
     static func status() -> Never {
-        guard let recorder = PIDFile.read() else { print(Style.dim("○ not recording")); exit(1) }
+        let watching = Watcher.runningPID().map { Style.dim("watching for calls (pid \($0))") }
+            ?? Style.dim("not watching for calls (rec watch --install)")
+        guard let recorder = PIDFile.read() else { print(Style.dim("○ not recording")); print(watching); exit(1) }
         let sessionURL = URL(fileURLWithPath: recorder.dir).appendingPathComponent("session.json")
         let session = (try? Data(contentsOf: sessionURL)).flatMap { try? JSONDecoder().decode(SessionInfo.self, from: $0) }
         let elapsed = session.map { "  " + clock(Date().timeIntervalSince1970 - Double($0.startEpochMs) / 1000) } ?? ""
@@ -386,6 +392,7 @@ enum Launcher {
             print("  \(Style.dim("mic    "))  \(name)")
         }
         print("  \(Style.dim("session"))  \(Style.path(recorder.dir))")
+        print(watching)
         exit(0)
     }
 

@@ -12,6 +12,7 @@ install: app
 	rm -rf "$(APP_DIR)/Rec.app"
 	cp -R build/Rec.app "$(APP_DIR)/Rec.app"
 	ln -sf "$(APP_DIR)/Rec.app/Contents/MacOS/rec" "$(BIN_DIR)/rec"
+	@"$(BIN_DIR)/rec" _watch-restart
 	@echo "installed $(APP_DIR)/Rec.app, linked $(BIN_DIR)/rec"
 
 # Ad-hoc signatures change on every build; if a rebuilt Rec records silence,
