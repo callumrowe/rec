@@ -35,6 +35,8 @@ struct SessionInfo: Codable {
     var source: Source?
     /// An import's `--as dictation|conversation`; absent means decided by how many voices the diarizer hears.
     var importAs: String?
+    /// The call that `rec watch` started this recording for, e.g. "Zoom".
+    var autoStartedBy: String?
 
     var isDictation: Bool { mode == "dictation" }
     var isImport: Bool { mode == "import" }
@@ -52,6 +54,7 @@ final class Recorder {
     private let dir: URL
     private let requestedMicUID: String?
     private let dictation: Bool
+    private let trigger: String?
     private var micIsBuiltIn = true
     private let interactive = isatty(STDOUT_FILENO) != 0
     private var t0: UInt64 = 0
@@ -86,10 +89,11 @@ final class Recorder {
     static let silenceThreshold = 1e-4  // -80 dBFS; real mics idle around -60..-70
     static let silenceWarnAfter: TimeInterval = 10
 
-    init(dir: URL, micUID: String? = nil, dictation: Bool = false) {
+    init(dir: URL, micUID: String? = nil, dictation: Bool = false, trigger: String? = nil) {
         self.dir = dir
         self.requestedMicUID = micUID
         self.dictation = dictation
+        self.trigger = trigger
     }
 
     func run() -> Never {
@@ -110,6 +114,7 @@ final class Recorder {
         session = SessionInfo(start: iso8601.string(from: startDate),
                               startEpochMs: Int64((startDate.timeIntervalSince1970 * 1000).rounded()),
                               micDeviceUID: micUID)
+        session.autoStartedBy = trigger
         if dictation {
             session.mode = "dictation"
             session.files = ["mic": "mic.wav"]

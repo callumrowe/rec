@@ -13,6 +13,8 @@ rec start --mic streamcam    # skip the question (name substring or UID); --yes 
 rec start --dictate          # mic only, for thinking aloud; becomes a Dictation note
 rec devices                  # list inputs, their UIDs, and which one rec would default to
 rec stop
+rec watch --install          # record calls automatically, from every login (--uninstall turns it off)
+rec watch --list             # what is using the mic / speakers right now, and whether that counts as a call
 rec verify [SESSION_DIR]     # length / silence / sync check (default: latest session)
 rec open                     # open ~/Recordings/rec in Finder
 rec import                   # pick a Voice Memo, import it as a session and transcribe it
@@ -34,6 +36,37 @@ Sessions go to `~/Recordings/rec/<yyyy-MM-dd_HHmmss>/` (or `--out DIR`):
 | `talk.json`   | a meeting's VAD timeline: speech regions per track, your turns and the talk stats (see [Talk time](#talk-time)) |
 | `transcribe.log` | transcription progress and FluidAudio / Core ML diagnostics |
 | `transcript.<engine>.json` | words (per track), speakers, turns and timings from the last run of that engine |
+
+## Automatic call recording
+
+`rec watch --install` adds a login item (a LaunchAgent, `com.callumrowe.rec.watch`)
+that runs `rec watch` all the time and records calls without being asked. It logs
+to `~/Library/Logs/rec-watch.log`; `rec status` says whether it's running, and
+`make install` restarts it on the new build.
+
+- **What counts as a call:** it reads Core Audio's process list every 2 s (which
+  apps have the mic or speakers running), so it never opens the mic itself and the
+  orange indicator stays off. Zoom, Teams, Slack, FaceTime, Webex, Discord,
+  WhatsApp and any browser (Meet, Whereby, web Zoom…) holding the mic is a call.
+  Any other app holding the mic counts only while something is also playing.
+  Siri, dictation, Sound Recognition, Voice Memos, dictation apps and rec itself
+  never count.
+- **Start:** 4 s into the call it runs `rec start --detach --yes` (default mic,
+  mic + system audio), shows a notification and a menu bar icon with
+  *Stop and transcribe*, *Discard this recording* and *Pause auto-record for an hour*.
+  `session.json` records which app started it as `autoStartedBy`.
+- **Stop:** once no app has held the mic for 15 s the recording stops and is
+  transcribed in the background as usual. A call under 60 s (mic test, wrong
+  link) is deleted instead.
+- **Leaves you in charge:** if a recording is already running, or you stop an
+  automatic one yourself (`rec stop` or the menu), it leaves that call alone
+  until it ends.
+- **Settings:** `watch` in `config.json`, every key optional:
+  `{"apps": ["com.example.app"], "ignore": ["com.example.dictate"],
+  "startAfterSeconds": 4, "stopAfterSeconds": 15, "discardShorterThanSeconds": 60, "notify": true}`.
+  `apps` and `ignore` match a bundle ID prefix or executable name, as `rec watch --list` prints them.
+- **Permissions:** the first background transcription from the watcher may ask
+  for Rec to access the Documents folder (where the vault lives). Allow it once.
 
 ## Transcription
 

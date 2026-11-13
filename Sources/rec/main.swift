@@ -6,6 +6,8 @@ usage: rec start [--out DIR] [--mic NAME|UID] [--yes] [--detach] [--dictate]
                                           (--dictate: mic only, transcribed as a dictation note)
        rec stop                           stop the running recording
        rec status                         show whether a recording is running
+       rec watch [--install|--uninstall]  record calls automatically while Zoom, Meet, Teams… has the mic
+         [--list]                         (--install: from every login; --list: what's using audio now)
        rec devices                        list input devices for --mic
        rec verify [DIR]                   check a session (default: latest) for length, silence, sync
        rec open                           open the recordings folder in Finder
@@ -40,6 +42,8 @@ switch args.first {
 case "start": Launcher.start(Array(args.dropFirst()))
 case "stop": Launcher.stop()
 case "status": Launcher.status()
+case "watch": Watcher.run(Array(args.dropFirst()))
+case "_watch-restart": Watcher.restartIfInstalled(); exit(0)
 case "devices": Launcher.devices()
 case "verify": Verify.run(Array(args.dropFirst()))
 case "open": Launcher.openRecordings()
@@ -50,8 +54,9 @@ case "config": ConfigCommand.run(Array(args.dropFirst()))
 case "_talk": TalkCommand.run(Array(args.dropFirst()))
 case "_record" where args.count >= 2:
     let rest = args.dropFirst(2)
+    let trigger = rest.first { $0.hasPrefix("--trigger=") }.map { String($0.dropFirst("--trigger=".count)) }
     Recorder(dir: URL(fileURLWithPath: args[1]), micUID: rest.first { !$0.hasPrefix("-") },
-             dictation: rest.contains("--dictate")).run()
+             dictation: rest.contains("--dictate"), trigger: trigger).run()
 case nil, "-h", "--help", "help": print(usage)
 default: fail("unknown command \(args[0])\n\(usage)", code: 64)
 }

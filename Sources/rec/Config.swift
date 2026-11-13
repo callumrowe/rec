@@ -8,6 +8,8 @@ struct Config: Codable {
     var model: String?
     /// The menu bar talk-time dot and the note's talk stats; absent means the defaults.
     var talk: TalkSettings?
+    /// `rec watch`: automatic call recording; absent means the defaults.
+    var watch: WatchSettings?
 
     static let url = Paths.home.appendingPathComponent(".config/rec/config.json")
 
