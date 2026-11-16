@@ -113,7 +113,8 @@ final class Watcher: NSObject {
         let running = PIDFile.read()
         var detector = CallDetector(extraApps: settings.apps ?? [], extraIgnored: settings.ignore ?? [])
         if let running { detector.ownPIDs.insert(running.pid) }
-        let call = detector.detect(AudioProcesses.current())
+        let detected = detector.detect(AudioProcesses.current())
+        let call = detected?.name
 
         switch state {
         case .idle:
@@ -129,7 +130,9 @@ final class Watcher: NSObject {
         case .pending(let app, let since):
             guard let call, pausedUntil == nil else { state = .idle; return }
             if running != nil { state = .standingBy(lastCall: now); return }
-            if now.timeIntervalSince(since) >= settings.startAfter { start(app: call == app ? app : call, callStart: since) }
+            if now.timeIntervalSince(since) >= settings.startAfter {
+                start(app: call == app ? app : call, callStart: since, detected: detected)
+            }
 
         case .recording(var r):
             guard isAlive(r.pid) else {
@@ -156,11 +159,20 @@ final class Watcher: NSObject {
 
     // MARK: - Start / stop
 
-    private func start(app: String, callStart: Date) {
+    private func start(app: String, callStart: Date, detected: Call?) {
         say("\(app) call detected; starting to record")
+        // Record the mic the call is using (headset, webcam, built-in...), whatever
+        // the lid or the system default says; else fall back to rec's default rule.
+        var arguments = ["start", "--detach", "--yes", "--trigger", app]
+        if let mic = detected?.mic(lidClosed: isLidClosed() == true) {
+            say("\(app) is using \(mic.name); recording that mic")
+            arguments += ["--mic", mic.uid]
+        } else {
+            say("can't tell which mic \(app) is using; using rec's default")
+        }
         let p = Foundation.Process()
         p.executableURL = URL(fileURLWithPath: Self.executablePath())
-        p.arguments = ["start", "--detach", "--yes", "--trigger", app]
+        p.arguments = arguments
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = FileHandle.standardOutput
         p.standardError = FileHandle.standardError
@@ -376,10 +388,15 @@ final class Watcher: NSObject {
         for p in processes {
             let io = [p.input ? "mic" : nil, p.output ? "speakers" : nil].compactMap { $0 }.joined(separator: " + ")
             let note = detector.isIgnored(p) ? Style.faint("  ignored") : ""
-            print("  \(Style.bold(detector.displayName(p)))  \(Style.dim(io))  \(Style.faint(p.key))\(note)")
+            let inputs = AudioDevices.inputs()
+            let mics = p.inputDeviceUIDs.map { uid in inputs.first { $0.uid == uid }?.name ?? uid }
+            let from = mics.isEmpty ? "" : Style.dim(" (\(mics.joined(separator: ", ")))")
+            print("  \(Style.bold(detector.displayName(p)))  \(Style.dim(io))\(from)  \(Style.faint(p.key))\(note)")
         }
         if let call = detector.detect(AudioProcesses.current()) {
-            print("\(Style.strong("●", Style.accent)) \(Style.bold("call:")) \(call)")
+            let mic = call.mic(lidClosed: isLidClosed() == true).map { "  " + Style.dim("mic: \($0.name)") }
+                ?? "  " + Style.dim("mic: rec's default")
+            print("\(Style.strong("●", Style.accent)) \(Style.bold("call:")) \(call.name)\(mic)")
         } else {
             print(Style.dim("○ no call"))
         }
