@@ -206,10 +206,18 @@ honoured depends on the sharing app.
   must deliver something above digital silence. For system audio it plays a quiet
   "Tink" and checks the tap captured it, because a tap without permission returns
   silence that looks exactly like "nothing playing".
-- **Mic:** `AVAudioEngine` pinned by device UID to the chosen mic
-  (`kAudioOutputUnitProperty_CurrentDevice`). It never follows the system default
-  input. If the device goes away, the gap is logged and filled with silence,
-  system audio keeps recording, and capture resumes when the same UID returns.
+- **Mic:** a plain HAL IO proc on the chosen device, pinned by UID. It never
+  follows the system default input. If the device goes away, the gap is logged and
+  filled with silence, system audio keeps recording, and capture resumes when the
+  same UID returns.
+- **Start order matters.** With a process tap running, macOS won't start an input
+  device in the same process: `AudioDeviceStart` blocks forever. (`AVAudioEngine`
+  is worse: it also stops itself when the tap's aggregate appears, then hangs
+  restarting, which hung every recording once the tap had permission.) So the mic
+  starts first, and a mid-call mic restart stops the tap around it. A tap started
+  after the mic stays asleep until something plays, so the test chime is played
+  without waiting for buffers, and "no buffers since the tap started" isn't
+  treated as a broken tap.
 - **One timeline:** both tracks are positioned against a single `mach_absolute_time`
   start (t0) using each buffer's host timestamp. When a track falls behind, the
   missing time is filled with silence. When it runs ahead, the overlap is dropped
