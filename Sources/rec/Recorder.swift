@@ -275,8 +275,10 @@ final class Recorder {
             log(String(format: "✓ mic: %@ is live (%.0f dB)", micName, 20 * log10(micPeakRMS)))
         } else if mic.secondsSinceLastBuffer.isInfinite {
             log("✗ mic: no audio arriving from \(micName): \(hint)")
+            alert("Not hearing your mic", "No audio is arriving from \(micName).")
         } else {
             log("✗ mic: \(micName) is sending pure silence: \(hint)")
+            alert("Not hearing your mic", "\(micName) is sending pure silence.")
         }
     }
 
@@ -298,6 +300,8 @@ final class Recorder {
             systemCheckFailed = true
             log("✗ system audio: test chime was not captured. Rec is probably missing System Audio Recording permission "
                 + "(System Settings › Privacy & Security › Screen & System Audio Recording). Stop, fix it, and start again.")
+            alert("Not hearing the other side of this call",
+                  "Rec is missing System Audio Recording permission. Turn it on in System Settings › Privacy & Security.")
         }
     }
 
@@ -386,6 +390,13 @@ final class Recorder {
             session?.events.append(.init(t: (t * 1000).rounded() / 1000, message: message))
         }
         say("\(Style.faint(clock(t)))  \(Style.event(message))")
+    }
+
+    /// A failed startup check in a background recording (rec watch, --detach) only
+    /// reaches rec.log, which nobody reads mid-call: raise a notification instead.
+    private func alert(_ title: String, _ message: String) {
+        guard !interactive else { return }
+        Watcher.notify(title, message)
     }
 
     private func say(_ message: String) {

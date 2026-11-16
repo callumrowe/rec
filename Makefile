@@ -15,8 +15,8 @@ install: app
 	@"$(BIN_DIR)/rec" _watch-restart
 	@echo "installed $(APP_DIR)/Rec.app, linked $(BIN_DIR)/rec"
 
-# Ad-hoc signatures change on every build; if a rebuilt Rec records silence,
-# clear its old grants and let macOS prompt again.
+# If Rec records silence (e.g. after switching signing identity, or an ad-hoc
+# build), clear its old grants and let macOS prompt again.
 reset-permissions:
 	tccutil reset Microphone com.callumrowe.rec
 	tccutil reset AudioCapture com.callumrowe.rec
