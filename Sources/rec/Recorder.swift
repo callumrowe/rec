@@ -152,12 +152,21 @@ final class Recorder {
             indicator = TalkIndicator(settings: talkSettings)
         }
 
+        // Mic first: macOS won't start an input device while a process tap is running
+        // (AudioDeviceStart blocks forever), so the tap comes second and is paused
+        // around any later mic restart. Both tracks share t0, so sync is unaffected.
+        mic = MicCapture(uid: micUID, writer: micWriter, log: log)
+        mic.whileSystemPaused = { [weak self] body in
+            guard let self, let system = self.system, system.isRunning else { return body() }
+            system.stop()
+            body()
+            self.startSystem()
+        }
+        mic.start()
         if let systemWriter {
             system = SystemTap(writer: systemWriter)
             startSystem()
         }
-        mic = MicCapture(uid: micUID, writer: micWriter, log: log)
-        mic.start()
         saveSession()
 
         let meterTimer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
@@ -217,10 +226,13 @@ final class Recorder {
 
         if ticks % 2 == 0 {
             mic.poll()
-            // An aggregate device runs continuously (zeros when nothing plays), so
-            // no buffers at all means the tap broke, not that the call went quiet.
-            if let system, let systemMeter, (!system.isRunning || systemMeter.secondsSinceLastBuffer > 3),
-               Date().timeIntervalSince(lastSystemRestart) > 5 {
+            // Once running, the aggregate delivers continuously (zeros when nothing
+            // plays), so buffers stopping means the tap broke. But a tap started while
+            // the mic is already running stays asleep until something plays: no
+            // buffers since the (re)start is that, not a fault, and the writer pads it.
+            let sinceRestart = Date().timeIntervalSince(lastSystemRestart)
+            if let system, let systemMeter, sinceRestart > 5,
+               !system.isRunning || (systemMeter.secondsSinceLastBuffer > 3 && systemMeter.secondsSinceLastBuffer < sinceRestart) {
                 if system.isRunning { log("system: no audio buffers for 3s, rebuilding tap") }
                 system.stop()
                 startSystem()
@@ -290,7 +302,9 @@ final class Recorder {
             systemConfirmed = true
             log(chimePlayedAt == nil ? "✓ system audio: capturing" : "✓ system audio: capture confirmed (heard test chime)")
         }
-        if !systemConfirmed, chimePlayedAt == nil, system.isRunning, systemMeter.secondsSinceLastBuffer < 1 {
+        // Don't wait for buffers first: the tap may be asleep until something plays,
+        // and the chime is what wakes it.
+        if !systemConfirmed, chimePlayedAt == nil, system.isRunning {
             chime = NSSound(named: "Tink")
             chime?.volume = 0.3
             chime?.play()

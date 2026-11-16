@@ -5,18 +5,32 @@ import Foundation
 /// Records one specific input device, pinned by UID. Never follows the system
 /// default input: if the device goes away, capture stops (the writer pads the
 /// gap with silence) and resumes when the same UID comes back.
+///
+/// Uses a plain HAL IO proc on the device rather than AVAudioEngine. With a
+/// process tap running (SystemTap), macOS will not start a new input IO proc:
+/// AudioDeviceStart blocks forever, and AVAudioEngine additionally stops itself
+/// when the tap's aggregate device appears, then hangs trying to restart. So the
+/// mic must start before the tap, and any later restart goes through
+/// `whileSystemPaused`, which stops the tap around it.
 final class MicCapture {
     let uid: String
     private let writer: TrackWriter
     private let log: (String) -> Void
-    private var engine: AVAudioEngine?
     private var deviceID = AudioObjectID(kAudioObjectUnknown)
-    private var observer: NSObjectProtocol?
+    private var procID: AudioDeviceIOProcID?
+    private var buffers: UnsafeMutableAudioBufferListPointer?
     private var lostAt: Date?
     private var lastAttempt = Date.distantPast
     private var lastFailure: String?
+    private var startedAt = Date.distantPast
+    /// Host time of the last IO callback; written on writer.queue, read on main.
+    private let lastBufferLock = NSLock()
+    private var lastBufferHost: UInt64 = 0
 
-    var isRunning: Bool { engine != nil }
+    /// Runs a (re)start with the system tap stopped; set by Recorder.
+    var whileSystemPaused: (() -> Void) -> Void = { $0() }
+
+    var isRunning: Bool { procID != nil }
 
     init(uid: String, writer: TrackWriter, log: @escaping (String) -> Void) {
         self.uid = uid
@@ -24,10 +38,14 @@ final class MicCapture {
         self.log = log
     }
 
-    /// Main thread only.
+    deinit { stopIO() }
+
+    /// Main thread only. The first start must happen before the system tap starts.
     func start() {
         lastAttempt = Date()
-        switch startEngine() {
+        var result = StartResult.failure("not started")
+        whileSystemPaused { result = startIO() }
+        switch result {
         case .success:
             if let lostAt {
                 log(String(format: "mic: %@ back after %.1fs, resumed", uid, Date().timeIntervalSince(lostAt)))
@@ -39,92 +57,86 @@ final class MicCapture {
         }
     }
 
-    /// Main thread, ~1 Hz. Detects the device vanishing or being swapped out, and reconnects.
+    /// Main thread, ~1 Hz. Detects the device vanishing or going quiet at the IO
+    /// level (no callbacks at all, not just silence), and reconnects.
     func poll() {
-        if let engine {
+        if procID != nil {
             let alive = AudioDevices.isAlive(deviceID) && AudioDevices.device(uid: uid) == deviceID
-            if !alive { stopEngine(); markLost("device disappeared") }
-            else if currentDevice(of: engine) != deviceID { stopEngine(); markLost("engine switched away from pinned device") }
-            else if !engine.isRunning { stopEngine(); markLost("engine stopped") }
+            if !alive {
+                stopIO(); markLost("device disappeared")
+            } else if Date().timeIntervalSince(startedAt) > 3, secondsSinceLastCallback() > 3 {
+                stopIO(); markLost("device stopped delivering audio")
+            }
         }
-        // Retry quickly when the device is present, otherwise just watch for it.
-        if engine == nil, AudioDevices.device(uid: uid) != nil, Date().timeIntervalSince(lastAttempt) >= 2 {
+        // Retry when the device is present, otherwise just watch for it.
+        if procID == nil, AudioDevices.device(uid: uid) != nil, Date().timeIntervalSince(lastAttempt) >= 2 {
             start()
         }
     }
 
     func stop() {
-        stopEngine()
+        stopIO()
     }
 
     private enum StartResult { case success, failure(String) }
 
-    private func startEngine() -> StartResult {
+    private func startIO() -> StartResult {
         guard let device = AudioDevices.device(uid: uid) else { return .failure("device not present") }
-        let engine = AVAudioEngine()
-        let input = engine.inputNode
-        guard let unit = input.audioUnit else { return .failure("no input audio unit") }
-        var dev = device
-        let status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
-                                          &dev, UInt32(MemoryLayout<AudioObjectID>.size))
-        guard status == noErr else { return .failure("could not pin device (OSStatus \(status))") }
-        // After switching devices the node's output format can still describe the
-        // previous (default) device; a tap in that format never receives buffers.
-        // Use the pinned device's hardware rate and channel count instead.
-        let hardware = input.inputFormat(forBus: 0)
-        guard hardware.sampleRate > 0, hardware.channelCount > 0,
-              let format = AVAudioFormat(standardFormatWithSampleRate: hardware.sampleRate, channels: hardware.channelCount)
+        guard var asbd = try? AudioDevices.get(device, kAudioDevicePropertyStreamFormat, initial: AudioStreamBasicDescription(),
+                                               scope: kAudioObjectPropertyScopeInput),
+              asbd.mSampleRate > 0, asbd.mChannelsPerFrame > 0,
+              let format = AVAudioFormat(streamDescription: &asbd)
         else { return .failure("device reports no input format") }
 
+        // A non-interleaved stream arrives as one buffer per channel; take the first stream's.
+        let count = format.isInterleaved ? 1 : Int(format.channelCount)
+        let list = AudioBufferList.allocate(maximumBuffers: count)
         let writer = self.writer
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, when in
-            let host = when.isHostTimeValid ? when.hostTime : mach_absolute_time()
-            writer.queue.sync { writer.process(buffer, hostTime: host) }
+        let lock = lastBufferLock
+        var proc: AudioDeviceIOProcID?
+        let status = AudioDeviceCreateIOProcIDWithBlock(&proc, device, writer.queue) { [weak self] _, inputData, inputTime, _, _ in
+            let input = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+            let ts = inputTime.pointee
+            let host = ts.mFlags.contains(.hostTimeValid) ? ts.mHostTime : mach_absolute_time()
+            lock.withLock { self?.lastBufferHost = mach_absolute_time() }
+            guard input.count >= count else { return }
+            for i in 0..<count { list[i] = input[i] }
+            guard let pcm = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: list.unsafePointer, deallocator: nil) else { return }
+            writer.process(pcm, hostTime: host)
         }
-        observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
-                                                          object: engine, queue: .main) { [weak self] _ in
-            guard let self, self.engine === engine else { return }
-            // AVAudioEngine posts this spuriously right after starting on a
-            // non-default device; only rebuild if it actually stopped or moved.
-            if engine.isRunning, self.currentDevice(of: engine) == device { return }
-            self.stopEngine()
-            self.log("mic: audio configuration changed, reattaching to \(self.uid)")
-            self.start()
+        guard status == noErr, let proc else {
+            free(list.unsafeMutablePointer)
+            return .failure("could not open device (OSStatus \(status))")
         }
-        do {
-            engine.prepare()
-            try engine.start()
-        } catch {
-            input.removeTap(onBus: 0)
-            if let observer { NotificationCenter.default.removeObserver(observer) }
-            observer = nil
-            return .failure("engine start failed: \(error.localizedDescription)")
+        let started = AudioDeviceStart(device, proc)
+        guard started == noErr else {
+            AudioDeviceDestroyIOProcID(device, proc)
+            free(list.unsafeMutablePointer)
+            return .failure("could not start device (OSStatus \(started))")
         }
-        guard currentDevice(of: engine) == device else {
-            engine.stop()
-            input.removeTap(onBus: 0)
-            return .failure("engine did not stay on pinned device")
-        }
-        self.engine = engine
+        procID = proc
         deviceID = device
+        buffers = list
+        startedAt = Date()
+        lastBufferLock.withLock { lastBufferHost = mach_absolute_time() }
         return .success
     }
 
-    private func stopEngine() {
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        observer = nil
-        guard let engine else { return }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        self.engine = nil
+    private func stopIO() {
+        if let procID {
+            AudioDeviceStop(deviceID, procID)
+            AudioDeviceDestroyIOProcID(deviceID, procID)
+        }
+        procID = nil
+        // Let any in-flight IO block finish before freeing its buffer list.
+        writer.queue.sync {}
+        if let buffers { free(buffers.unsafeMutablePointer) }
+        buffers = nil
     }
 
-    private func currentDevice(of engine: AVAudioEngine) -> AudioObjectID? {
-        guard let unit = engine.inputNode.audioUnit else { return nil }
-        var dev = AudioObjectID(kAudioObjectUnknown)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        guard AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, &size) == noErr else { return nil }
-        return dev
+    private func secondsSinceLastCallback() -> Double {
+        let last = lastBufferLock.withLock { lastBufferHost }
+        return hostSeconds(from: last, to: mach_absolute_time())
     }
 
     private func markLost(_ reason: String) {
