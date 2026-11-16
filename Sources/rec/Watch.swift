@@ -290,11 +290,12 @@ final class Watcher: NSObject {
         print("\(f.string(from: Date()))  \(message)")
     }
 
-    static func notify(_ title: String, _ message: String) {
+    static func notify(_ title: String, _ message: String, sound: Bool = false) {
         func quoted(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
         let p = Foundation.Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = ["-e", "display notification \(quoted(message)) with title \"rec\" subtitle \(quoted(title))"]
+        p.arguments = ["-e", "display notification \(quoted(message)) with title \"rec\" subtitle \(quoted(title))"
+                       + (sound ? " sound name \"Basso\"" : "")]
         try? p.run()
     }
 

@@ -88,6 +88,14 @@ final class Recorder {
 
     static let silenceThreshold = 1e-4  // -80 dBFS; real mics idle around -60..-70
     static let silenceWarnAfter: TimeInterval = 10
+    /// System audio below -80 dB this long, after capture was confirmed, counts as broken.
+    static let systemQuietWarnAfter: TimeInterval = 180
+    /// How often to repeat the notification while a side still isn't recording.
+    static let nagEvery: TimeInterval = 120
+
+    private var activeProblems: Set<String> = []
+    private var warning: CaptureWarning?
+    private var lastNag: Date?
 
     init(dir: URL, micUID: String? = nil, dictation: Bool = false, trigger: String? = nil) {
         self.dir = dir
@@ -261,6 +269,7 @@ final class Recorder {
                          hint: systemConfirmed ? "nothing is playing (capture was confirmed earlier, so the call may just be quiet)"
                              : "if audio is playing, Rec is missing System Audio Recording permission (System Settings › Privacy & Security › Screen & System Audio Recording)")
         }
+        updateHealth(currentProblems(micMeter, lidClosed: lidClosed))
 
         let barWidth = systemMeter == nil ? (terminalColumns() - 32).clamped(6, 48) : ((terminalColumns() - 46) / 2).clamped(6, 24)
         let dot = ticks % 2 == 0 ? Style.strong("●", Style.accent) : Style.faint("●")
@@ -287,10 +296,8 @@ final class Recorder {
             log(String(format: "✓ mic: %@ is live (%.0f dB)", micName, 20 * log10(micPeakRMS)))
         } else if mic.secondsSinceLastBuffer.isInfinite {
             log("✗ mic: no audio arriving from \(micName): \(hint)")
-            alert("Not hearing your mic", "No audio is arriving from \(micName).")
         } else {
             log("✗ mic: \(micName) is sending pure silence: \(hint)")
-            alert("Not hearing your mic", "\(micName) is sending pure silence.")
         }
     }
 
@@ -314,8 +321,6 @@ final class Recorder {
             systemCheckFailed = true
             log("✗ system audio: test chime was not captured. Rec is probably missing System Audio Recording permission "
                 + "(System Settings › Privacy & Security › Screen & System Audio Recording). Stop, fix it, and start again.")
-            alert("Not hearing the other side of this call",
-                  "Rec is missing System Audio Recording permission. Turn it on in System Settings › Privacy & Security.")
         }
     }
 
@@ -347,11 +352,62 @@ final class Recorder {
         if Date().timeIntervalSince(since) >= Self.silenceWarnAfter, !silenceWarned.contains(track) {
             silenceWarned.insert(track)
             log("⚠ \(track) has been silent for \(Int(Self.silenceWarnAfter))s: \(hint)")
-            // Mid-call (the startup check already covers a mic that was never live):
-            // the lid closed on the built-in mic, or the mic was unplugged.
-            if track == "mic", micPeakRMS >= Self.silenceThreshold {
-                alert("Your mic has gone silent", "\(micName) stopped sending audio. Lid closed or mic unplugged?")
+        }
+    }
+
+    // MARK: - Capture health
+
+    /// What's wrong with each side right now, as (menu bar label, notification title, detail).
+    private func currentProblems(_ micMeter: TrackWriter.Meter, lidClosed: Bool) -> [Problem] {
+        var out: [Problem] = []
+        // A live mic never sits below -80 dB for 10s (its noise floor is -60..-70),
+        // whether or not you're talking or muted in the call app.
+        // The startup check (at 4s) catches a mic that was never live a little sooner.
+        let neverLive = micChecked && micPeakRMS < Self.silenceThreshold && silentSince["mic"] != nil
+        if silenceWarned.contains("mic") || neverLive {
+            let why = lidClosed ? "The MacBook lid is closed, which mutes the built-in mic."
+                : micMeter.rms == nil ? "No audio is arriving from \(micName)."
+                : "\(micName) is sending pure silence."
+            out.append(Problem(key: "mic", label: "MIC", title: "Not recording your voice", detail: why))
+        }
+        if system != nil {
+            if systemCheckFailed && !systemConfirmed {
+                out.append(Problem(key: "system", label: "THEM", title: "Not recording the other side",
+                                   detail: "Rec is missing System Audio Recording permission (System Settings › Privacy & Security)."))
+            } else if let since = silentSince["system"], Date().timeIntervalSince(since) >= Self.systemQuietWarnAfter {
+                // Calls play comfort noise; minutes of digital silence means the capture broke.
+                out.append(Problem(key: "system", label: "THEM", title: "Not hearing the other side",
+                                   detail: "Nothing from the call for \(Int(Self.systemQuietWarnAfter / 60)) minutes. Is the call audio going somewhere else?"))
             }
+        }
+        return out
+    }
+
+    /// Keeps the menu bar warning in step with `problems`, and notifies (with a sound)
+    /// when a side stops recording and every `nagEvery` while it stays broken.
+    private func updateHealth(_ problems: [Problem]) {
+        let keys = Set(problems.map(\.key))
+        let new = problems.filter { !activeProblems.contains($0.key) }
+        for p in new { log("✗ \(p.key) is not being recorded: \(p.detail)") }
+        for key in activeProblems.subtracting(keys) { log("✓ \(key) is recording again") }
+        activeProblems = keys
+
+        guard !problems.isEmpty else {
+            warning?.remove()
+            warning = nil
+            lastNag = nil
+            return
+        }
+        if warning == nil {
+            NSApplication.shared.setActivationPolicy(.accessory)
+            warning = CaptureWarning()
+        }
+        warning?.show(problems)
+        if !new.isEmpty || lastNag.map({ Date().timeIntervalSince($0) >= Self.nagEvery }) == true {
+            lastNag = Date()
+            let p = new.first ?? problems[0]
+            let still = new.isEmpty ? "Still: " : ""
+            Watcher.notify(still + p.title, p.detail, sound: true)
         }
     }
 
@@ -370,6 +426,7 @@ final class Recorder {
         let micResult = micWriter.finalize(frames: frames)
         let systemResult = systemWriter?.finalize(frames: frames)
         indicator?.remove()
+        warning?.remove()
         var talkFile: TalkFile?
         if let file = talk?.finish(timeout: 3) {
             do {
@@ -411,13 +468,6 @@ final class Recorder {
         say("\(Style.faint(clock(t)))  \(Style.event(message))")
     }
 
-    /// A failed startup check in a background recording (rec watch, --detach) only
-    /// reaches rec.log, which nobody reads mid-call: raise a notification instead.
-    private func alert(_ title: String, _ message: String) {
-        guard !interactive else { return }
-        Watcher.notify(title, message)
-    }
-
     private func say(_ message: String) {
         eventsLock.withLock {
             let prefix = meterLineVisible ? "\r\u{1B}[2K" : ""
@@ -445,4 +495,41 @@ private func writeOut(_ s: String) {
 
 extension Comparable {
     func clamped(_ lo: Self, _ hi: Self) -> Self { min(max(self, lo), hi) }
+}
+
+/// One side of the recording that isn't being captured right now.
+struct Problem {
+    let key: String     // "mic" or "system"
+    let label: String   // short, for the menu bar
+    let title: String
+    let detail: String
+}
+
+/// A red "⚠ MIC not recording" in the menu bar for as long as a side of the call
+/// isn't being recorded, so it's visible mid-call even if a notification was
+/// missed. Like the talk dot it's a status item, kept out of screen shares.
+final class CaptureWarning {
+    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private var shown = ""
+
+    /// Main thread.
+    init() {
+        item.button?.window?.sharingType = .none
+    }
+
+    /// Main thread.
+    func show(_ problems: [Problem]) {
+        let text = "⚠ " + problems.map(\.label).joined(separator: " + ") + " not recording"
+        guard text != shown else { return }
+        shown = text
+        item.button?.attributedTitle = NSAttributedString(string: text, attributes: [
+            .foregroundColor: NSColor.systemRed,
+            .font: NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .bold),
+        ])
+        item.button?.toolTip = problems.map { "\($0.title): \($0.detail)" }.joined(separator: "\n")
+    }
+
+    func remove() {
+        NSStatusBar.system.removeStatusItem(item)
+    }
 }

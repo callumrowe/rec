@@ -248,9 +248,21 @@ honoured depends on the sharing app.
   (this cost the other side of a call once). Override with `REC_SIGN_IDENTITY`.
   If Rec still records silence, run `make reset-permissions` and approve the
   prompts on the next `rec start`.
-- **Background recordings alert.** A ✗ startup check in a recording with no
-  terminal (`rec watch`, `--detach`) also posts a notification, since nobody
-  reads `rec.log` mid-call. So does a mic that was live and then goes silent for
-  10 s (lid closed on the built-in mic, mic unplugged).
+- **A side that isn't recording is flagged during the call.** While either track
+  is broken, a red **⚠ MIC not recording** / **⚠ THEM not recording** sits in the
+  menu bar (kept out of screen shares; hover for why), and a notification with a
+  sound fires straight away and again every 2 minutes until it recovers. The mic
+  counts as broken when it's been below -80 dBFS for 10 s (or was never live at
+  the 4 s check); a real mic never is, even when you're muted in the call app.
+  System audio counts as broken when the test chime wasn't captured, or after
+  3 minutes of digital silence (calls play comfort noise). Both are logged as
+  `✗ … is not being recorded` / `✓ … is recording again`.
+- **Voice processing changes the built-in mic.** When a call app turns on Apple's
+  voice processing (Safari/WebRTC calls, FaceTime and others), the built-in mic
+  switches from 1 channel to its raw 3-capsule array, ~28 dB quieter, until that
+  app lets go. rec reads the channel count from every buffer, so it copes whether
+  that happens before or during a recording: it mixes the capsules and adds the
+  gain back. (Before this, the mic failed to open for the whole of a Safari call.)
+  A sample-rate change on the mic reopens it at the new rate.
 - `rec verify` measures sync by cross-correlating the tracks' energy envelopes.
   That only works when the mic can hear the speakers. With headphones, check by ear.
