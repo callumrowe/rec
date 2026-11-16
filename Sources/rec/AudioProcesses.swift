@@ -13,6 +13,8 @@ enum AudioProcesses {
         let name: String
         let input: Bool
         let output: Bool
+        /// UIDs of the input devices this process is capturing from right now.
+        let inputDeviceUIDs: [String]
 
         /// Bundle ID, or the executable name for daemons without one (e.g. avconferenced).
         var key: String { bundleID ?? name }
@@ -30,14 +32,40 @@ enum AudioProcesses {
             let input = ((try? AudioDevices.get(id, kAudioProcessPropertyIsRunningInput, initial: UInt32(0))) ?? 0) != 0
             let output = ((try? AudioDevices.get(id, kAudioProcessPropertyIsRunningOutput, initial: UInt32(0))) ?? 0) != 0
             let bundleID = AudioDevices.string(id, kAudioProcessPropertyBundleID).flatMap { $0.isEmpty ? nil : $0 }
-            return Process(pid: pid, bundleID: bundleID, name: processName(pid), input: input, output: output)
+            return Process(pid: pid, bundleID: bundleID, name: processName(pid), input: input, output: output,
+                           inputDeviceUIDs: input ? inputDevices(id) : [])
         }
+    }
+
+    /// kAudioProcessPropertyDevices in the input scope: the devices a process is recording from.
+    private static func inputDevices(_ process: AudioObjectID) -> [String] {
+        var addr = AudioDevices.address(kAudioProcessPropertyDevices, kAudioObjectPropertyScopeInput)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(process, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(process, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids.compactMap(AudioDevices.uid)
     }
 
     static func processName(_ pid: pid_t) -> String {
         var buf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
         guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return "pid \(pid)" }
         return URL(fileURLWithPath: String(cString: buf)).lastPathComponent
+    }
+}
+
+/// A detected call: the app's display name and the process holding the mic.
+struct Call {
+    let name: String
+    let process: AudioProcesses.Process
+
+    /// The mic the call app is actually recording from, if rec can record it too:
+    /// a real device (not a virtual/aggregate one like ZoomAudioDevice), and not the
+    /// built-in mic with the lid closed (hardware-muted).
+    func mic(lidClosed: Bool) -> AudioDevices.Input? {
+        let inputs = AudioDevices.inputs()
+        return process.inputDeviceUIDs.lazy.compactMap { uid in inputs.first { $0.uid == uid } }
+            .first { $0.kind != "virtual" && !(lidClosed && $0.kind == "built-in") }
     }
 }
 
@@ -103,21 +131,21 @@ struct CallDetector {
         ownPIDs.contains(p.pid) || (Self.ignored + extraIgnored).contains { matches(p, $0) }
     }
 
-    /// The call app's display name if a call is running, else nil.
+    /// The call if one is running, else nil.
     /// A known call app (or a browser) holding the mic is a call. Any other app
     /// holding the mic counts only while something is also playing audio, which
     /// is the "mic and system audio at once" signal without listening to either.
-    func detect(_ processes: [AudioProcesses.Process]) -> String? {
+    func detect(_ processes: [AudioProcesses.Process]) -> Call? {
         let candidates = processes.filter { !isIgnored($0) }
         let usingMic = candidates.filter(\.input)
         for p in usingMic {
             if let app = Self.callApps.first(where: { matches(p, $0.prefix) }) {
-                return app.name == "browser call" ? "\(displayName(p)) call" : app.name
+                return Call(name: app.name == "browser call" ? "\(displayName(p)) call" : app.name, process: p)
             }
-            if extraApps.contains(where: { matches(p, $0) }) { return displayName(p) }
+            if extraApps.contains(where: { matches(p, $0) }) { return Call(name: displayName(p), process: p) }
         }
         if let p = usingMic.first, candidates.contains(where: \.output) {
-            return displayName(p)
+            return Call(name: displayName(p), process: p)
         }
         return nil
     }

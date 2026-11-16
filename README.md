@@ -51,10 +51,17 @@ to `~/Library/Logs/rec-watch.log`; `rec status` says whether it's running, and
   Any other app holding the mic counts only while something is also playing.
   Siri, dictation, Sound Recognition, Voice Memos, dictation apps and rec itself
   never count.
-- **Start:** 4 s into the call it runs `rec start --detach --yes` (default mic,
-  mic + system audio), shows a notification and a menu bar icon with
+- **Start:** 4 s into the call it runs `rec start --detach --yes` (mic + system
+  audio), shows a notification and a menu bar icon with
   *Stop and transcribe*, *Discard this recording* and *Pause auto-record for an hour*.
   `session.json` records which app started it as `autoStartedBy`.
+- **Which mic:** the one the call app is recording from (Core Audio's
+  `kAudioProcessPropertyDevices`), passed as `--mic`, so headset, webcam or
+  built-in matches the call whatever the lid or system default says. If that's a
+  virtual device (ZoomAudioDevice, Krisp…) or the built-in mic with the lid
+  closed, it falls back to rec's default rule. The choice is logged, and
+  `rec watch --list` shows each app's mic. It is fixed at start: if the call
+  switches mic mid-call, rec keeps the first one.
 - **Stop:** once no app has held the mic for 15 s the recording stops and is
   transcribed in the background as usual. A call under 60 s (mic test, wrong
   link) is deleted instead.
@@ -243,6 +250,7 @@ honoured depends on the sharing app.
   prompts on the next `rec start`.
 - **Background recordings alert.** A ✗ startup check in a recording with no
   terminal (`rec watch`, `--detach`) also posts a notification, since nobody
-  reads `rec.log` mid-call.
+  reads `rec.log` mid-call. So does a mic that was live and then goes silent for
+  10 s (lid closed on the built-in mic, mic unplugged).
 - `rec verify` measures sync by cross-correlating the tracks' energy envelopes.
   That only works when the mic can hear the speakers. With headphones, check by ear.

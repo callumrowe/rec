@@ -347,6 +347,11 @@ final class Recorder {
         if Date().timeIntervalSince(since) >= Self.silenceWarnAfter, !silenceWarned.contains(track) {
             silenceWarned.insert(track)
             log("⚠ \(track) has been silent for \(Int(Self.silenceWarnAfter))s: \(hint)")
+            // Mid-call (the startup check already covers a mic that was never live):
+            // the lid closed on the built-in mic, or the mic was unplugged.
+            if track == "mic", micPeakRMS >= Self.silenceThreshold {
+                alert("Your mic has gone silent", "\(micName) stopped sending audio. Lid closed or mic unplugged?")
+            }
         }
     }
 
