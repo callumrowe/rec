@@ -225,8 +225,16 @@ honoured depends on the sharing app.
 - **Lid closed = silent mic.** In clamshell mode the MacBook hardware-mutes the
   built-in mic. rec's default skips it when the lid is closed, and asks before
   using it anyway.
-- **Rebuilds and permissions.** The app is ad-hoc signed, so every build has a
-  new signature. If a rebuilt Rec suddenly records silence, run
-  `make reset-permissions` and approve the prompts again on the next `rec start`.
+- **Rebuilds and permissions.** macOS ties the Microphone and System Audio
+  Recording grants to the app's signature. `scripts/build-app.sh` signs with the
+  first Developer ID (or Apple Development) certificate in the keychain, so the
+  grants survive rebuilds. Without one it falls back to ad-hoc signing, where
+  every build looks like a new app and the system track silently records zeros
+  (this cost the other side of a call once). Override with `REC_SIGN_IDENTITY`.
+  If Rec still records silence, run `make reset-permissions` and approve the
+  prompts on the next `rec start`.
+- **Background recordings alert.** A ✗ startup check in a recording with no
+  terminal (`rec watch`, `--detach`) also posts a notification, since nobody
+  reads `rec.log` mid-call.
 - `rec verify` measures sync by cross-correlating the tracks' energy envelopes.
   That only works when the mic can hear the speakers. With headphones, check by ear.
